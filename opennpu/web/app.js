@@ -600,7 +600,7 @@ async function toggleMic() {
     MIC.rec = null;
     btn.classList.remove("rec"); btn.setAttribute("aria-label", "Start voice input");
     const blob = new Blob(MIC.chunks, { type: mime || "audio/webm" });
-    if (blob.size < 2000) return;
+    if (blob.size < 2000) { toast("Recording too short, try again"); return; }
     btn.disabled = true; btn.title = "Transcribing on the NPU";
     try {
       const fd = new FormData();

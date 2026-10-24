@@ -444,7 +444,7 @@ test("vision: attach an image, it is shown and answered; text models refuse with
 test("voice: the mic records, transcribes on the server, and fills the message box", async ({ page }) => {
   await page.click("#micBtn");
   await expect(page.locator("#micBtn")).toHaveClass(/rec/);
-  await page.waitForTimeout(1200);
+  await page.waitForTimeout(2500);                 // slow CI machines start the fake mic late
   await page.click("#micBtn");
   await expect(page.locator("#input")).toHaveValue("hello from the microphone", { timeout: 15000 });
 });

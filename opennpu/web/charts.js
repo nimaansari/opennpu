@@ -34,7 +34,7 @@ function chartCard(root, title, opts = {}) {
   const card = document.createElement("section");
   card.className = "chart-card" + (opts.wide ? " wide" : "");
   card.innerHTML = `<header><h3>${esc(title)}</h3>${opts.note ? `<span class="fine">${esc(opts.note)}</span>` : ""}
-    <button class="link-btn" type="button" aria-pressed="false">Table</button></header><div class="chart-body"></div><div class="chart-table" hidden></div>`;
+    <button class="link-btn" type="button" aria-pressed="false">Table</button></header><div class="chart-body"></div><div class="chart-table" tabindex="0" role="region" aria-label="Chart data as a table" hidden></div>`;
   root.append(card);
   const btn = card.querySelector(".link-btn"), body = card.querySelector(".chart-body"), table = card.querySelector(".chart-table");
   btn.onclick = () => {

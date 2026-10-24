@@ -96,7 +96,7 @@ async function renderUsage() {
 
   const rc = document.createElement("section");
   rc.className = "chart-card wide";
-  rc.innerHTML = `<header><h3>Recent requests</h3><span class="fine">latest 50 in this range</span></header><div class="table-wrap"></div>`;
+  rc.innerHTML = `<header><h3>Recent requests</h3><span class="fine">latest 50 in this range</span></header><div class="table-wrap" tabindex="0" role="region" aria-label="Recent requests"></div>`;
   grid.append(rc);
   fillTable($(".table-wrap", rc), ["Time", "Kind", "Model", "App", "Result", "Tokens in", "Tokens out", "tok/s", "First token", "Duration"],
     u.recent.map((r) => [fmtTime(r.ts, true), KIND[r.kind] || r.kind, r.model, APP[r.client] || r.client, STATUS[r.status] || r.status,
