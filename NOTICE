@@ -1,0 +1,32 @@
+OpenNPU
+Copyright 2026 OpenNPU contributors
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product includes or builds on the following third-party work:
+
+- Phosphor Icons (opennpu/web/icons, opennpu/desktop/icons): MIT License,
+  Copyright (c) 2023 Phosphor Icons. See opennpu/web/icons/LICENSE.
+- MLIR-AIR (Xilinx/AMD): MIT License. OpenNPU's fused engines use the MLIR-AIR
+  fused_decode programming example with the modifications in
+  opennpu/native/patches/ (applied at install time; the patch is under MIT), and
+  its shared fused prefill (programming_examples/llms/shared/fused_prefill),
+  unmodified, for batched prompt prefill.
+- MLIR-AIE, IRON and LLVM-AIE (Peano) (Xilinx/AMD): Apache License 2.0 with LLVM
+  exceptions / Apache License 2.0. The prebuilt overlays in opennpu/kernels were
+  built from OpenNPU's own designs (tools/build_kernels.py) with these toolchains.
+  The universal GEMM backend uses IRON's open `flm.GEMM` operator (Apache-2.0).
+- The 4-bit GEMV/GEMM NPU kernels and device builder (opennpu/native/npu4/kernels/*.cc,
+  opennpu/native/npu4/gemv_device.py) are derived from MLIR-AIR's lm_gemv.py / gemv_q4.cc
+  examples and stay under their MIT License (Copyright (C) 2026 Advanced Micro Devices, Inc.,
+  and the OpenNPU authors), as marked in each file. tools/gemm_design.py is derived from
+  MLIR-AIE and stays under Apache-2.0 WITH LLVM-exception.
+- llama.cpp / ggml (ggml-org): MIT License. llama/build.sh downloads a pinned llama.cpp
+  revision at install time and adds OpenNPU's ggml backend (llama/ggml-opennpu, llama/include)
+  to it. The backend's files are MIT-licensed, as marked in each file, matching ggml's license.
+- AMD XRT: Apache License 2.0. llama/build.sh downloads XRT's public C++ headers (pinned tag)
+  to compile against the system's libxrt.
+- AMD XRT runtime and the amdxdna driver are system dependencies (Apache-2.0 / GPL-2.0),
+  not distributed with OpenNPU.
+
+Models are downloaded by the user from their publishers (e.g. Hugging Face) and are
+subject to their own licenses.

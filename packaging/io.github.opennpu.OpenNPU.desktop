@@ -1,0 +1,21 @@
+[Desktop Entry]
+Type=Application
+Name=OpenNPU
+GenericName=Local AI on the NPU
+Comment=Chat, images, video and speech with local models on your AMD Ryzen AI NPU
+Exec=opennpu-desktop
+Icon=io.github.opennpu.OpenNPU
+Terminal=false
+Categories=Science;ArtificialIntelligence;
+Keywords=AI;LLM;chat;NPU;Ryzen;local;offline;image;speech;
+StartupNotify=true
+StartupWMClass=io.github.opennpu.OpenNPU
+Actions=new-chat;web-ui;
+
+[Desktop Action new-chat]
+Name=New conversation
+Exec=opennpu-desktop --new-chat
+
+[Desktop Action web-ui]
+Name=Open web UI
+Exec=xdg-open http://127.0.0.1:11540

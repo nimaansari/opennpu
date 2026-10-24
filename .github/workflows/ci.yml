@@ -1,0 +1,34 @@
+# Everything that runs without NPU hardware: the real server and UIs against fake engines.
+# The NPU paths are covered by tests/qa/live_smoke.py and tests/sweep.py on a Ryzen AI machine.
+name: ci
+on: [push, pull_request]
+jobs:
+  api:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install numpy ml_dtypes pillow huggingface_hub pytest ruff
+      - run: ruff check opennpu tests
+      - run: python -m pytest -q tests/unit tests/qa/test_api.py
+  web:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install numpy pillow huggingface_hub
+      - uses: actions/setup-node@v4
+        with: { node-version: "22" }
+      - working-directory: tests/e2e
+        run: npm ci && npx playwright install --with-deps chromium && OPENNPU_PY=python npx playwright test
+  desktop:
+    runs-on: ubuntu-24.04          # libadwaita 1.5: checks the fallbacks for older distros
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install numpy pillow huggingface_hub
+      - run: sudo apt-get update && sudo apt-get install -y python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 python3-pytest xvfb
+      - run: OPENNPU_PY=python xvfb-run -a -s "-screen 0 1280x800x24" /usr/bin/python3 -m pytest -q tests/qa/test_desktop_app.py

@@ -1,0 +1,1398 @@
+# applies to Xilinx/mlir-air b755300 (supersedes mlir-air-fused-decode-12b-14b.patch: adds the qwen3-30b-a3b MoE path)
+diff --git a/programming_examples/fused_decode/fused_decode.py b/programming_examples/fused_decode/fused_decode.py
+index ecb29b1..8743336 100644
+--- a/programming_examples/fused_decode/fused_decode.py
++++ b/programming_examples/fused_decode/fused_decode.py
+@@ -523,6 +523,59 @@ _MODELS = {
+         # (it wrapped: every logit NaN). 8 gives four 0.9 GiB groups.
+         DECODE_WGROUP=8,
+     ),
++    # Mistral-Nemo-12B (opennpu): first K=5120 geometry. Same 2x4x1 attention as
++    # llama-3.1-8b (32 q / 8 kv, DH=128) with a decoupled q dim (DQ=4096 != K).
++    #   I2P = [6144, 5120, 28672, 5120]/1024 = [6, 5, 28, 5]
++    #   J2P = [5120, 4096, 5120, 14336]/512  = [10, 8, 10, 28]
++    "mistral-nemo-12b": dict(
++        K=5120, M=6144, DH_A=128, KV_PER_CU=2, N_ATTN_CU=4, NPH=4,
++        I2P=[6, 5, 28, 5], J2P=[10, 8, 10, 28],
++        DEST=["rope", "rms", "glu", "rms"], GQA_SEG=4, PAIR_ROWS=2, N_NORMS=2,
++        VOCAB_SIZE=131072, UNI_DEC=40,
++        UNI_LM=13, VOCAB_CHUNK_I2=10,  # 131072 -> 133120 padded -> 130 = 13 x 10
++        DECODE_STACK=6144,
++        DECODE_WGROUP=5,  # 40 layers x 0.21 GiB -> eight 1.06 GiB groups
++    ),
++    # Qwen3-14B (opennpu): 40 q / 8 kv = GQA 5, padded to 8 per kv head and run
++    # on ATTN_IMPL_2x8x1 (2 kv per CU, 16 padded q slots). K=5120 needs LEAN_RMS.
++    #   I2P = [7168, 5120, 34816, 5120]/1024 = [7, 5, 34, 5]
++    #   J2P = [5120, 5120, 5120, 17408]/512  = [10, 10, 10, 34]
++    # Vocab 151936 -> 153600 padded -> 150 chunk-rows = 5 waves x 30.
++    "qwen3-14b": dict(
++        K=5120, M=7168, DH_A=128, KV_PER_CU=2, N_ATTN_CU=4, NPH=4,
++        I2P=[7, 5, 34, 5], J2P=[10, 10, 10, 34],
++        DEST=["rope", "rms", "glu", "rms"], GQA_SEG=8, PAIR_ROWS=2, N_NORMS=2,
++        HAS_QK_NORM=True, VOCAB_SIZE=151936, UNI_DEC=40,
++        UNI_LM=5, VOCAB_CHUNK_I2=30,
++        DECODE_STACK=6144,
++        DECODE_WGROUP=5,
++    ),
++    # Qwen2.5-14B / DeepSeek-R1-Distill-Qwen-14B (opennpu): same attention as
++    # qwen3-14b, q/k/v bias instead of qk-norm, INTER 13824 (27 x 512: odd, so
++    # GLU_SLICE 512), 48 layers.
++    "qwen2.5-14b": dict(
++        K=5120, M=7168, DH_A=128, KV_PER_CU=2, N_ATTN_CU=4, NPH=4,
++        I2P=[7, 5, 27, 5], J2P=[10, 10, 10, 27],
++        DEST=["rope", "rms", "glu", "rms"], GQA_SEG=8, PAIR_ROWS=2, N_NORMS=2,
++        HAS_QKV_BIAS=True, VOCAB_SIZE=152064, UNI_DEC=48,
++        UNI_LM=5, VOCAB_CHUNK_I2=30,
++        DECODE_STACK=6144,
++        DECODE_WGROUP=6,
++    ),
++    # Qwen3-30B-A3B (opennpu MoE): ONE layer per dispatch with a ROTATED phase
++    # order -- [gate-up(E_{k-1}) -> glu*w -> down -> residual] then
++    # [input-norm -> QKV(k) -> rope/attn -> o(k) -> residual] -- so the host can
++    # route layer k between dispatches. The 8 selected experts are bound as 8
++    # weight-tensor args and form a dense INTER=8*768=6144 SwiGLU. See
++    # opennpu/native/MOE_DESIGN_fused_decode.md.
++    "qwen3-30b-a3b": dict(
++        K=2048, M=5120, DH_A=128, KV_PER_CU=1, N_ATTN_CU=4, NPH=4,
++        I2P=[12, 2, 5, 2], J2P=[4, 12, 4, 8],
++        DEST=["glu", "rms", "rope", "rms"], GQA_SEG=8, PAIR_ROWS=2, N_NORMS=2,
++        HAS_QK_NORM=True, VOCAB_SIZE=151936, UNI_DEC=1,
++        UNI_LM=5, VOCAB_CHUNK_I2=30,
++        GLU_PKTS=1, MOE_TOPK=8, MOE_EXPERT_INTER=768,
++    ),
+     # ===== LFM2-1.2B: a HYBRID conv-attention decoder, whole model ==========
+     #
+     # 16 layers in one wave loop, with the mixer chosen per wave by the arm
+@@ -565,7 +618,16 @@ _MODELS = {
+     ),
+ }
+ MODEL_NAME = _os.environ.get("DECODE_MODEL", "llama-3.2-1b")
++# opennpu: a model spec generated from config.json (opennpu.native.specgen) can be
++# handed in directly as JSON instead of being added to the table above.
++if _os.environ.get("DECODE_MODEL_JSON"):
++    import json as _json
++
++    _MODELS[MODEL_NAME] = _json.loads(_os.environ["DECODE_MODEL_JSON"])
+ MODEL = {**_MODEL_DEFAULTS, **_MODELS[MODEL_NAME]}
++# Mixture of experts (rotated layer, experts bound as tensor args); 0 = dense.
++MOE_TOPK = int(MODEL.get("MOE_TOPK", 0))
++MOE = MOE_TOPK > 0
+ # The build stamps embed this so editing a model's entry invalidates its warm
+ # templates. Queried by the Makefiles with FUSED_DECODE_PRINT_CONST, which prints
+ # any global by name -- the same hook GLU_SLICE uses.
+@@ -684,7 +746,11 @@ def _arm_only(arm_i, kinds, body, in_dec=False):
+ # puts each on its OWN demux destination; naming them all "<mixer>" shares one.
+ # Both are supported and both were measured -- neither on its own fixes the
+ # full-width deadlock (the two adjacent tiles below are what does).
+-MIXER_NAME = MODEL["DEST"][0]
++MIXER_NAME = (
++    next(d for d in MODEL["DEST"] if d.split("#")[0] in ("rope", "conv", "mix"))
++    if MOE
++    else MODEL["DEST"][0]
++)
+ 
+ 
+ def _is_mixer_dest(name):
+@@ -739,13 +805,13 @@ MIX_PROW = 4 if HYBRID_MIXER else 2
+ # "rope" = attention, "conv" = ShortConv only, "mix" = HYBRID (both, chosen per
+ # wave by the arm). Anything else is unimplemented and must fail loudly rather
+ # than silently emit one mixer's kernel over the other's width.
+-if MODEL["DEST"][0].split("#")[0] not in ("rope", "conv", "mix"):
++if MIXER_NAME.split("#")[0] not in ("rope", "conv", "mix"):
+     raise NotImplementedError(
+-        f"DECODE_MODEL={MODEL_NAME} wants ph0 mixer '{MODEL['DEST'][0]}'; this "
++        f"DECODE_MODEL={MODEL_NAME} wants ph0 mixer '{MIXER_NAME}'; this "
+         "engine implements only 'rope', 'conv' and 'mix'."
+     )
+ assert (
+-    MODEL["DEST"][0].split("#")[0] == "mix"
++    MIXER_NAME.split("#")[0] == "mix"
+ ) == HYBRID_MIXER, (
+     "a 'mix' ph0 dest needs ATTN_LAYERS, and ATTN_LAYERS needs a 'mix' dest"
+ )
+@@ -815,7 +881,9 @@ DQ_PADDED_PER_CU = Q_HEADS_PADDED_PER_CU * DH  # per-CU q/o/y buffer 512 / 1024
+ DQ_PADDED = (
+     CONV_DIM if CONV_MIXER else MODEL["N_ATTN_CU"] * DQ_PADDED_PER_CU
+ )  # 2048 / 4096
+-SSZ_BLK = ((Q_HEADS_PADDED_PER_CU * 16 + 16 + 63) // 64) * 64  # score buffer 192 / 128
++# Online-softmax correction floats per score block (kernels/model_spec.h).
++ATTN_C_FLOATS = max(8, Q_HEADS_PADDED_PER_CU)
++SSZ_BLK = ((Q_HEADS_PADDED_PER_CU * 16 + 2 * ATTN_C_FLOATS + 63) // 64) * 64  # 192 / 128 / 320
+ 
+ # ============================ faithful config ===============================
+ # Reproducer: Llama-3.2-1B decode layer, single token. QKV proj = q(2048)+k(512)+
+@@ -967,6 +1035,22 @@ POST_RMS = bool(DECODE_GOLDEN)
+ # norms are applied to the sublayer OUTPUT before the residual add. Falls back to
+ # 1 when POST_RMS is off (debug configs), keeping RMS_LAYER byte-identical.
+ N_NORMS = MODEL["N_NORMS"] if POST_RMS else 1
++# Lean rms core (NORM_FOLD): the standard decode body holds up to seven K-wide L1
++# buffers (x, w, w2, xn, o-proj, h, down/r2). At K=5120 that is 70 KB against a
++# 64 KB tile. Two changes make it three:
++#  - the RMSNorm weights are FOLDED into the next projection on the host
++#    (q/k/v cols *= input_ln, gate/up cols *= post_attention_ln, lm_head cols *=
++#    final norm -- exact), so the core runs a weightless norm and the rmsW/rmsW2
++#    channels do not exist;
++#  - residual_add already writes its sum back into x, so h and r2 are copies:
++#    x is updated in place and the o-proj buffer is reused for down.
++# Only engaged where the standard body cannot fit, so every K<=4096 build stays
++# byte-identical. The HOST must fold the weights for such a build (NORM_FOLD).
++LEAN_RMS = MODEL["K"] * 2 * 7 + MODEL["DECODE_STACK"] > 65536 or bool(
++    int(_os.environ.get("FORCE_LEAN_RMS", "0"))
++)
++NORM_FOLD = LEAN_RMS
++assert not (NORM_FOLD and MODEL["N_NORMS"] >= 4), "NORM_FOLD: gemma sandwich not supported"
+ ATTN_ROUNDS = (ATTN_L + 15) // 16
+ # Decode is always multi-block; the L=1 single-token path (attn_qk_p1 /
+ # attn_kv_p1) was removed. ATTN_L (=DECODE_GOLDEN_L) stays a real parameter
+@@ -1110,9 +1194,15 @@ J2P = MODEL["J2P"]  # col-block pairs (2*J2 = NBJ = K/COL_BLOCK)
+ # deriving the index keeps the routing number out of the source entirely.
+ DEST_NAMES = MODEL["DEST"]
+ DEMUX = list(dict.fromkeys(DEST_NAMES))  # ordinal order: ["rope", "rms", "glu"]
++if MOE:
++    # rotated schedule: keep rope at ordinal 0 (the QKV gets hardcode [0, 0])
++    _ORD = ["rope", "rms", "glu"]
++    DEMUX = sorted(DEMUX, key=lambda d: _ORD.index(d) if d in _ORD else len(_ORD))
+ NDEST = len(DEMUX)
+ DEST = [DEMUX.index(d) for d in DEST_NAMES]  # phase -> ordinal
+ DOWN_PHASE = NPH - 1
++if MOE:  # down follows gate-up, not the end of the table
++    DOWN_PHASE = next(p for p in range(DEST_NAMES.index("glu") + 1, NPH) if DEST_NAMES[p] == "rms")
+ NBJ_PH = [2 * J2P[p] for p in range(NPH)]  # per-phase col-blocks: [8,8,8,32]
+ KPH = [NBJ_PH[p] * COL_BLOCK for p in range(NPH)]  # per-phase K: [2048,2048,2048,8192]
+ 
+@@ -1178,7 +1268,7 @@ VOCAB_ROWBLKS = VOCAB_I2 * (NCX * NCY) * PAIR_ROWS  # rowblocks per chunk/dispat
+ VOCAB_SIZE_PADDED = VOCAB_ROWBLKS * ROW_BLOCK  # logits per chunk (device drain size)
+ assert VOCAB_FULL_ROWBLKS % VOCAB_ROWBLKS == 0, "chunk must divide the full vocab"
+ N_VOCAB_CHUNKS = VOCAB_FULL_ROWBLKS // VOCAB_ROWBLKS  # host dispatches (9)
+-VOCAB_J2 = J2P[0]  # 4 (K=MODEL_DIM=2048 -> NBJ=8 col-blocks)
++VOCAB_J2 = (K // (2 * COL_BLOCK)) if MOE else J2P[0]  # 4 (K=MODEL_DIM=2048 -> NBJ=8 col-blocks)
+ # ---- proj b_col_reduce_add cache (see kernels/proj_qmm.cc proj_qmm_acc256_c) ----
+ # The +min-term reduction of the activation depends only on the col-block j, not
+ # on the row-block i, so it is computed on the first row-block of a projection
+@@ -1245,8 +1335,8 @@ ATTN_WAVES = tuple(_k for _k in ATTN_LAYERS if _k < UNI_DEC)
+ # waves the fused launch loop drives). Used to split the fused sequence into a
+ # decode-part [0,UNI_DEC) and a vocab-part [UNI_DEC,UNI_WAVES) that share ONE CDO,
+ # to test host-wait quiescence between decode and vocab on one xclbin.
+-UNI_WAVE_LO = 0
+-UNI_WAVE_HI = UNI_WAVES
++UNI_WAVE_LO = int(_os.environ.get("DECODE_WAVE_LO", 0))
++UNI_WAVE_HI = int(_os.environ.get("DECODE_WAVE_HI", UNI_WAVES))
+ 
+ # Weight-buffer grouping: G decode layers per weight BO. A shim BD's byte offset
+ # is a uint32 (aiex.npu.address_patch $arg_plus -> uint32_t in AIETargetNPU), so
+@@ -1278,6 +1368,10 @@ ROUNDS_PER_DEST = [
+ # it (in_proj is exactly N_MIX_PH x M). Non-hybrid builds have no padding, so
+ # MIX_RNDS_PAD is 0 and every expression below reduces to the previous one.
+ MIX_RNDS_QKV = M // PAYLOAD
++# A compute tile's mem has 16 BDs; the rope core spends 4 on lut-in and q/k/v-out
++# and one per QKV round. Past that, land QKV with one reassembled BD. Engaged
++# only where the per-round form cannot fit, so existing builds are unchanged.
++QKV_ONE_BD = MIX_RNDS_QKV + 4 > 16 or bool(int(_os.environ.get("FORCE_QKV_ONE_BD", "0")))
+ MIX_RNDS_PAD = (ROUNDS_PER_DEST[0] - MIX_RNDS_QKV) if HYBRID_MIXER else 0
+ 
+ # Per-phase weight slab dims (phase0 QKV 96 row-blocks, phase1 o-proj 64). Same K
+@@ -1288,7 +1382,11 @@ MIX_RNDS_PAD = (ROUNDS_PER_DEST[0] - MIX_RNDS_QKV) if HYBRID_MIXER else 0
+ NBI_PH = [I2P[p] * PAIR_ROWS * NCX * NCY for p in range(NPH)]  # [96, 64, 512, 64]
+ PER_COL_PH = [(NBI_PH[p] // NCX) * NBJ_PH[p] for p in range(NPH)]  # per-phase NBJ
+ W_FAN_STEPS = sum(pc // NCY for pc in PER_COL_PH)  # per col, all phases
+-W_TOTAL_BLOCKS = sum(NBI_PH[p] * NBJ_PH[p] for p in range(NPH))  # packed q4k blocks
++# MoE: gate-up and down weights come from the 8 expert tensor args, not from w.
++MOE_PHASES = [] if not MOE else [p for p in range(NPH) if DEST_NAMES[p] == "glu"] + [
++    next(p for p in range(DEST_NAMES.index("glu") + 1, NPH) if DEST_NAMES[p] == "rms")
++]
++W_TOTAL_BLOCKS = sum(NBI_PH[p] * NBJ_PH[p] for p in range(NPH) if p not in MOE_PHASES)  # packed q4k blocks
+ if W_DUAL_CHAN:
+     # The split is spatial (each shim channel owns half the column's cores), so
+     # the only requirement is an even core count per column.
+@@ -1327,6 +1425,10 @@ GATEUP_PHASE = next((p for p in range(NPH) if DEST_NAMES[p] == "glu"), OPROJ_PHA
+ # (rmsnorm input); ph1 attn-o, ph2 a_xn, ph3 down are MEMTILE producers (mechanism-2
+ # per-buffer refeed) converging on @xnorm in phase-time order, read by ONE loop.
+ XN_REFEED = sum(REFEED[p] for p in MIXER_PHASES)
++# rms core refeed counts, in the order the core emits them: first norm (input
++# norm -> mixer/QKV), second norm (post-attention norm -> gate-up). The MoE
++# rotated layer runs gate-up first, so its two counts swap.
++RMS_RF1, RMS_RF2 = (REFEED[[p for p in range(NPH) if DEST_NAMES[p] == "glu"][0]], XN_REFEED) if MOE else (XN_REFEED, None)
+ 
+ # Which proj phase carries the KV append + cache readback. It has to be the
+ # LAST mixer phase (see the use site): the append feeds off rope's K/V, and rope
+@@ -1373,7 +1475,7 @@ HOST_DRAIN = [p for p in range(NDEST) if p != GLU_DEST and p != RMS_DEST]
+ # that gives an odd count (qwen2.5-7b: INTERMEDIATE/512 = 37) drop to one packet per
+ # slice: same 512-row interleave stride, half the slice, an even count, and the same
+ # total. The kernel is generic in the slice length (pseduo_glu<GLU_SLICE>).
+-GLU_PKTS = 2 if (ROUNDS_PER_DEST[GLU_DEST] // 2) % 2 == 0 else 1
++GLU_PKTS = MODEL.get("GLU_PKTS", 2 if (ROUNDS_PER_DEST[GLU_DEST] // 2) % 2 == 0 else 1)
+ GLU_CHUNK = GLU_PKTS * PAYLOAD // 2  # gate-up interleaves up/gate in chunks this tall
+ GLU_SLICE = GLU_PKTS * PAYLOAD  # 1024 = [up 512 | gate 512] (GLU_PKTS demux packets/BD)
+ GLU_HID = GLU_SLICE // 2  # 512 out per 1024 slice
+@@ -1397,7 +1499,22 @@ LAYER_RNDS = (PAIR_ROWS * I2P[DOWN_PHASE]) if FULL4 else 0
+ NLAYERS = int(_os.environ.get("NLAYERS", "1"))
+ # Per-layer DDR slab sizes (elements). LUT is per-position (shared across layers),
+ # placed after all NLAYERS rms slabs.
+-W_LAYER = sum(NCX * PER_COL_PH[p] * BLOCK_BF16 for p in range(NPH))  # weights / layer
++W_LAYER = sum(NCX * PER_COL_PH[p] * BLOCK_BF16 for p in range(NPH) if p not in MOE_PHASES)  # weights / layer
++# One expert slab = [gate-up cascade (2*EI x K) | down cascade (K x EI)], each packed
++# iteration-major + dual-channel by the host exactly like a dense phase of that size.
++MOE_EI = int(MODEL.get("MOE_EXPERT_INTER", 0))
++EXP_GU = (2 * MOE_EI // ROW_BLOCK) * (K // COL_BLOCK) * BLOCK_BF16 if MOE else 0
++EXP_DN = (K // ROW_BLOCK) * (MOE_EI // COL_BLOCK) * BLOCK_BF16 if MOE else 0
++EXP_LEN = EXP_GU + EXP_DN
++# Down is fed from ONE contiguous staging buffer (the proven dense weight feed, which
++# keeps the shim coalescer phase barrier), filled by the host each dispatch with the 8
++# selected experts' down weights in dense [cx][rh][i][j=e*3+je][cy] order. Feeding it
++# per-expert/per-row-block across 8 BOs lost the barrier -> only row-block 0 landed.
++DSTAGE_LEN = EXP_DN * MOE_TOPK if MOE else 0
++# MoE routing weights: the host writes the 8 selected experts' weights (bf16,
++# padded to 16) at the very end of the rms buffer each dispatch.
++MOE_RW_LEN = 16
++MOE_SLICES_PER_EXPERT = (MOE_EI // GLU_HID) if MOE else 0
+ RMS_LAYER = N_NORMS * K  # rms weights / layer (2 llama pre-norm / 4 Gemma sandwich)
+ KV_LAYER = ATTN_MAXL * KVSZ_TOK  # KV cache / layer
+ # ShortConv carried state [BX[t-2] | BX[t-1]] per layer, also in arg4.
+@@ -1453,6 +1570,7 @@ def build_module():
+             UNI_DEC * RMS_LAYER
+             + (UNI_DEC if ROPE_W_PER_LAYER else 1) * ROPE_W_LEN
+             + K  # dedicated final-norm slot for real lm_head (vocab)
++            + (MOE_RW_LEN if MOE else 0)  # MoE routing weights (8 used, padded)
+         ],
+         api_types.bf16,
+         name="rms",
+@@ -1484,6 +1602,12 @@ def build_module():
+     # func argument rather than a memref, which is what the host binds.
+     _tensors = (
+         [x_t, w_t, rms_t, y_t, kvc_t]
++        + (
++            [air_api.tensor([EXP_LEN], api_types.bf16, name=f"e{i}") for i in range(MOE_TOPK)]
++            + [air_api.tensor([DSTAGE_LEN], api_types.bf16, name="dstage")]
++            if MOE
++            else []
++        )
+         + [
+             air_api.tensor([n], api_types.bf16, name=f"wg{i + 1}")
+             for i, n in enumerate(_wgrp_len[1:])
+@@ -1677,9 +1801,22 @@ def build_module():
+         residual_add_aie = _kernel(
+             "residual_add_aie", [rms_l1, rms_l1, rms_l1], "rms_residual.o"
+         )
++        if NORM_FOLD:
++            rms_norm_now_aie = _kernel(
++                "rms_norm_now_aie", [rms_l1, rms_l1, i32], "rms_residual.o"
++            )
++        if LEAN_RMS:
++            residual_inplace_aie = _kernel(
++                "residual_inplace_aie", [rms_l1, rms_l1], "rms_residual.o"
++            )
+         # GLU: glu_aie(hid, x) = pseduo_glu<1024>: x = [hid 512 | gate 512],
+         # hid(512) = silu(gate)*hid. One 1024 slice per call. Prebuilt glu.o.
+         glu_aie = _kernel("glu_aie", [glu_hid_l1, glu_x_l1, i32], "glu.o")
++        if MOE:
++            moe_rw_l1 = MemRefType.get([MOE_RW_LEN], bf16, memory_space=l1)
++            glu_moe_aie = _kernel(
++                "glu_moe_aie", [glu_hid_l1, glu_x_l1, moe_rw_l1, i32, i32], "glu.o"
++            )
+         # reference rope_compute(q,k,v, qkv, lut): rotate-half RoPE on Q,K (V copied).
+         rope_compute = _kernel(
+             "rope_compute",
+@@ -1722,7 +1859,7 @@ def build_module():
+         #   qk: m_state(16 bf16 running max) + c_state(8 f32)
+         #   kv: y_state(512 f32 accumulator) + l_state(16 f32 denominator)
+         m_l1 = MemRefType.get([16], bf16, memory_space=l1)
+-        c_l1 = MemRefType.get([8], f32, memory_space=l1)
++        c_l1 = MemRefType.get([ATTN_C_FLOATS], f32, memory_space=l1)
+         y_l1 = MemRefType.get([DQ_PADDED_PER_CU], f32, memory_space=l1)
+         lden_l1 = MemRefType.get([16], f32, memory_space=l1)
+         attn_qk_blk = _attn_kernel(
+@@ -1765,8 +1902,11 @@ def build_module():
+             _chan("rmsX", size=[1], channel_type="npu_dma_packet")
+         else:
+             _chan("rmsX", size=[1])
+-        _chan("rmsW", size=[1])
+-        if POST_RMS:
++        if MOE:
++            _chan("moeRW", size=[1])
++        if not NORM_FOLD:
++            _chan("rmsW", size=[1])
++        if POST_RMS and not NORM_FOLD:
+             # Separate channel for the post_attention_layernorm weight. A single
+             # rmsW FIFO re-fed twice does NOT pair in AIR (both gets read the same
+             # put -> decode diverges). The rms compute tile has only 2 S2MM
+@@ -2022,7 +2162,7 @@ def build_module():
+         # arg index of each weight group's buffer: group 0 is the original arg1;
+         # groups 1.. and the lm-head follow the base args. Index into _la is +4.
+         _w_base_n = 5
+-        _n_w_extra = len(_tensors) - _w_base_n - (1 if DYNSEQ else 0)
++        _n_w_extra = len(_tensors) - _w_base_n - (1 if DYNSEQ else 0) - (MOE_TOPK + 1 if MOE else 0)
+         WARG = [1] + [_w_base_n + i for i in range(_n_w_extra)]
+ 
+         # The launch is already open -- air.launch bound each air.tensor to its
+@@ -2055,6 +2195,9 @@ def build_module():
+             # Value => a runtime group index into _WBUFS[0:N_WGRP].
+             _wsel = [None]
+             KVC = _la[8]
++            # MoE: the 8 selected expert slabs (bound per dispatch by the host).
++            EB = [_la[9 + i] for i in range(MOE_TOPK)]
++            DSTAGE = _la[9 + MOE_TOPK] if MOE else None
+             # The dispatch-time context length (DYNSEQ). Last operand before
+             # the multi-layer induction variable.
+             L_rt = _la[4 + len(_fa) - 1] if DYNSEQ else None
+@@ -2187,7 +2330,43 @@ def build_module():
+                         strides=[1],
+                     )
+ 
+-            def _feed_wcols(_wcol0, _colspan, nsteps):
++            def _feed_moe(p, EB):
++                """MoE gate-up / down weights from the 8 expert tensors.
++
++                Each expert slab is packed like a dense phase of its own size, so
++                the dense INTER=8*EI stream of a (column, channel) is the expert
++                runs in order -- gate-up: one run per expert; down: for every
++                proj row-iteration i, one run per expert (i is the core's outer
++                loop, the experts' column blocks are its inner j). Round-major
++                over the 2*NCX pinned channels, like the dense feed, because
++                the cores consume in X-broadcast lockstep.
++                """
++                assert W_DUAL_CHAN, "MoE feed assumes the dual-channel weight packing"
++                half_step = (NCY // 2) * blk
++                if p == GATEUP_PHASE:
++                    nbj = NBJ_PH[p]
++                    run = (2 * MOE_EI // ROW_BLOCK // (NCX * NCY)) * nbj * half_step
++                    rounds = [(e, (lambda cx, h, run=run: (cx * 2 + h) * run), run)
++                              for e in range(MOE_TOPK)]
++                else:
++                    nbj_e = MOE_EI // COL_BLOCK
++                    ni = I2P[p] * PAIR_ROWS
++                    run = nbj_e * half_step
++                    rounds = [(e, (lambda cx, h, i=i, run=run: EXP_GU + ((cx * 2 + h) * ni + i) * run), run)
++                              for i in range(ni) for e in range(MOE_TOPK)]
++                for e, off, sz in rounds:
++                    for _cxi in range(NCX):
++                        for ci in range(2):
++                            ChannelPut(
++                                _wname(ci, _cxi),
++                                EB[e],
++                                indices=[idx(0)],
++                                offsets=[idx(off(_cxi, ci))],
++                                sizes=[sz],
++                                strides=[1],
++                            )
++
++            def _feed_wcols(_wcol0, _colspan, nsteps, Wb=None):
+                 """Fan the phase's weight slab over the NCX proj columns.
+ 
+                 W_DUAL_CHAN uses per-column pinned channels, so the column index
+@@ -2224,6 +2403,9 @@ def build_module():
+                             Wb,
+                         )
+ 
++                if Wb is not None:
++                    _fan(Wb)
++                    return
+                 if not W_SPLIT:
+                     _fan(W)
+                 elif _wsel[0] is None:
+@@ -2374,7 +2556,7 @@ def build_module():
+                             rms_t[_final_norm_off - K : _final_norm_off + K]
+                         )
+                         _CH["rmsW2"].put(rms_t[0 : 2 * K])
+-                    else:
++                    elif not NORM_FOLD:
+                         _CH["rmsW"].put(rms_t[_final_norm_off : _final_norm_off + K])
+                         if POST_RMS:
+                             # DUMMY post-LN weight: rmsW2 is decode-only but packet-
+@@ -2430,7 +2612,7 @@ def build_module():
+                         # ids per S2MM port; the lo/hi kernels slice each half.
+                         _CH["rmsW"].put(rms_t[_rbase : _rbase + 2 * K])
+                         _CH["rmsW2"].put(rms_t[_rbase + 2 * K : _rbase + 4 * K])
+-                    else:
++                    elif not NORM_FOLD:
+                         _CH["rmsW"].put(rms_t[_rbase : _rbase + K])
+                         if POST_RMS:
+                             # post_attention_layernorm weight on its own channel.
+@@ -2651,11 +2833,25 @@ def build_module():
+                     # the reference cadence: interleave append+readback at the QKV|o
+                     # weight boundary -- append after QKV weights (rope has produced
+                     # K/V), barrier, readback, THEN o/up/down weights.
++                    if MOE:
++                        _rwo = (
++                            UNI_DEC * RMS_LAYER
++                            + (UNI_DEC if ROPE_W_PER_LAYER else 1) * ROPE_W_LEN
++                            + K
++                        )
++                        _CH["moeRW"].put(rms_t[_rwo : _rwo + MOE_RW_LEN])
+                     woff = 0
+                     for p in range(NPH):
+                         per_col = PER_COL_PH[p]
+                         assert per_col % NCY == 0
+                         _colspan = per_col * blk
++                        if MOE and p == GATEUP_PHASE:
++                            _feed_moe(p, EB)
++                            continue
++                        if MOE and p == DOWN_PHASE:
++                            # dense feed from the single down-staging buffer (barrier-safe)
++                            _feed_wcols(idx(0), per_col * blk, per_col // NCY, Wb=DSTAGE)
++                            continue
+                         # Spatial fan over the NCX proj columns: the bundle index
+                         # @inW[cx] must be an scf.parallel IV (canonical form; a
+                         # temporal scf.for over a bundle index is a verifier error).
+@@ -2909,6 +3105,8 @@ def build_module():
+                 # starves them.
+                 _xc_dec = (XN_REFEED + OPROJ_REFEED + GATEUP_REFEED) * (
+                     K // (2 * COL_BLOCK)
++                ) + (
++                    OPROJ_REFEED * ((DQ - K) // (2 * COL_BLOCK)) if MOE else 0
+                 ) + (
+                     DOWN_REFEED * (GLU_OUT // (2 * COL_BLOCK)) if DOWN_PHASE >= 0 else 0
+                 )
+@@ -3093,7 +3291,14 @@ def build_module():
+                     # get consumes one stripped packet round), just landing in
+                     # L1. In vocab mode id1 never flows so this compute-tile
+                     # S2MM idles harmlessly.
+-                    for _rq in range(MIX_RNDS_QKV if _own_qkv else 0):
++                    if _own_qkv and QKV_ONE_BD:
++                        # One full-size get: the id-1 packet flow reassembles the
++                        # MIX_RNDS_QKV 512-packets into a single dest BD, as the
++                        # rms core already does for o-proj/down. At M=7168 the
++                        # per-round form needs 14 BDs + 4 for lut/q/k/v: past
++                        # the 16 a compute tile's mem has.
++                        _CH["outY"].get(a_qkv[0:M], indices=[0, 0])
++                    for _rq in range(MIX_RNDS_QKV if (_own_qkv and not QKV_ONE_BD) else 0):
+                         _off = _rq * PAYLOAD
+                         _CH["outY"].get(a_qkv[_off : _off + PAYLOAD], indices=[0, 0])
+                     _scope = _rope_h.private() if _own_qkv else _conv_h.private()
+@@ -3655,7 +3860,7 @@ def build_module():
+                             )
+                             _CH["toAttnQ"].get(a_q, indices=[_c])
+                             a_m = air_api.alloc([16], api_types.bf16, scope=_ac)
+-                            a_cc = air_api.alloc([8], api_types.f32, scope=_ac)
++                            a_cc = air_api.alloc([ATTN_C_FLOATS], api_types.f32, scope=_ac)
+                             # RUNTIME-L block count = ceil(Lh/16) from the RTP-L herd
+                             # block-arg (opaque region arg -> not const-folded -> stays a
+                             # runtime scf.for bound; the AIE core loops per the RTP-L the
+@@ -4004,7 +4209,13 @@ def build_module():
+                             # Two distinct allocs per iter give air-to-aie a 2-deep
+                             # S2MM/MM2S ring (lock init 2), matching tile_5_2 -- a
+                             # rolled 1-call loop collapses to 1-slot (no overlap).
+-                            def _slice():
++                            if MOE:
++                                rw = air_api.alloc(
++                                    [MOE_RW_LEN], api_types.bf16, scope=_glu_h.private()
++                                )
++                                _CH["moeRW"].get(rw[0:MOE_RW_LEN])
++
++                            def _slice(sidx=None):
+                                 gx = air_api.alloc(
+                                     [GLU_SLICE],
+                                     api_types.bf16,
+@@ -4017,7 +4228,10 @@ def build_module():
+                                 gh = air_api.alloc(
+                                     [GLU_HID], api_types.bf16, scope=_glu_h.private()
+                                 )
+-                                glu_aie(gh, gx, _arm)
++                                if MOE:
++                                    glu_moe_aie(gh, gx, rw, sidx, _arm)
++                                else:
++                                    glu_aie(gh, gx, _arm)
+                                 _CH["gluOut"].put(gh[0:GLU_HID])
+                                 air_api.dealloc(gx)
+                                 air_api.dealloc(gh)
+@@ -4031,8 +4245,15 @@ def build_module():
+                                 f"(GLU_PKTS={GLU_PKTS})"
+                             )
+                             for _s in air_api.sequential(NGLU // 2):
+-                                _slice()  # ping
+-                                _slice()  # pong
++                                if MOE:
++                                    _s0 = arith.muli(_s.materialize(), idx(2))
++                                    _slice(arith.index_cast(i32, _s0))  # ping
++                                    _slice(arith.index_cast(i32, arith.addi(_s0, idx(1))))  # pong
++                                else:
++                                    _slice()  # ping
++                                    _slice()  # pong
++                            if MOE:
++                                air_api.dealloc(rw)
+ 
+                             yield_([])
+ 
+@@ -4454,7 +4675,7 @@ def build_module():
+                     def _put():
+                         _CH["xnorm"].put(buf[0:K])
+ 
+-                    refeed(XN_REFEED, _put)
++                    refeed(RMS_RF1, _put)
+ 
+                 def _rms_body(tx):
+                     _arm_rtp = _rms_h.params[0]
+@@ -4472,19 +4693,26 @@ def build_module():
+                         _rms_w_len = 2 * K if N_NORMS >= 4 else K
+                         _rms_final = rms_norm_hi_aie if N_NORMS >= 4 else rms_norm_aie
+                         _core = _rms_h.private()
+-                        a_xl = air_api.alloc([K], api_types.bf16, scope=_core)
+-                        _CH["rmsX"].get(a_xl, indices=[0])
+-                        a_wl = air_api.alloc([_rms_w_len], api_types.bf16, scope=_core)
+-                        _CH["rmsW"].get(a_wl, indices=[0])
+-                        if POST_RMS:
+-                            # consume the vocab dummy rmsW2 (see _uni_voc) so the
+-                            # shared rmsX/rmsW2 packet group has no vocab-mode hole.
+-                            a_w2l = air_api.alloc(
+-                                [_rms_w_len], api_types.bf16, scope=_core
+-                            )
+-                            _CH["rmsW2"].get(a_w2l, indices=[0])
+-                            air_api.dealloc(a_w2l)
+-                        a_xnl = air_api.alloc([K], api_types.bf16, scope=_core)
++                        if NORM_FOLD:
++                            # final norm weight folded into lm_head: x and its norm only.
++                            a_xl = air_api.alloc([K], api_types.bf16, scope=_core)
++                            _CH["rmsX"].get(a_xl, indices=[0])
++                            a_wl = None
++                            a_xnl = air_api.alloc([K], api_types.bf16, scope=_core)
++                        else:
++                            a_xl = air_api.alloc([K], api_types.bf16, scope=_core)
++                            _CH["rmsX"].get(a_xl, indices=[0])
++                            a_wl = air_api.alloc([_rms_w_len], api_types.bf16, scope=_core)
++                            _CH["rmsW"].get(a_wl, indices=[0])
++                            if POST_RMS:
++                                # consume the vocab dummy rmsW2 (see _uni_voc) so the
++                                # shared rmsX/rmsW2 packet group has no vocab-mode hole.
++                                a_w2l = air_api.alloc(
++                                    [_rms_w_len], api_types.bf16, scope=_core
++                                )
++                                _CH["rmsW2"].get(a_w2l, indices=[0])
++                                air_api.dealloc(a_w2l)
++                            a_xnl = air_api.alloc([K], api_types.bf16, scope=_core)
+                         # x re-broadcast. Baking the WHOLE count N=VOCAB_RNDS into one
+                         # re-broadcast puts it in a single producer-side credit lock, and
+                         # the AIE-ML lock is 7-bit (max +63, xaie_locks_aieml.c 0x7F), so
+@@ -4530,7 +4758,10 @@ def build_module():
+                         # the identical bytes: VOCAB_RNDS per wave, 252 per token
+                         # at ~1.5k cycles each, sitting directly in front of each
+                         # x-send that the 16 proj cores wait on.
+-                        _rms_final(a_xnl, a_xl, a_wl, _arm)
++                        if NORM_FOLD:
++                            rms_norm_now_aie(a_xnl, a_xl, _arm)
++                        else:
++                            _rms_final(a_xnl, a_xl, a_wl, _arm)
+                         for _rv in air_api.sequential(_voc_blks_2k):
+                             # a_xnl is now loop-invariant, so this IS a
+                             # re-broadcast: air-annotate-refeed collapses it to
+@@ -4573,7 +4804,8 @@ def build_module():
+                             _CH["outY"].get(a_v[0:K], indices=[0, RMS_DEST])
+                             _CH["layerOut"].put(a_v[0:K])
+                         air_api.dealloc(a_xl)
+-                        air_api.dealloc(a_wl)
++                        if a_wl is not None:
++                            air_api.dealloc(a_wl)
+                         air_api.dealloc(a_xnl)
+                         air_api.dealloc(a_v)
+ 
+@@ -4667,6 +4899,34 @@ def build_module():
+                     def _rbuf():
+                         return air_api.alloc([K], api_types.bf16, scope=_core)
+ 
++                    if NORM_FOLD:
++                        # Lean, weightless body (see NORM_FOLD): three K-wide
++                        # buffers. h = x + o-proj and r2 = h + down both land
++                        # in x; the o-proj buffer is reused for down.
++                        a_x = _rbuf()
++                        _CH["rmsX"].get(a_x, indices=[0])
++                        a_xn = _rbuf()
++                        rms_norm_now_aie(a_xn, a_x, _arm)
++                        _xn_refeed(a_xn, _arm)
++                        a_op = _rbuf()
++                        _CH["outY"].get(
++                            a_op[0 : OPROJ_RNDS * PAYLOAD], indices=[0, RMS_DEST]
++                        )
++                        residual_inplace_aie(a_x, a_op)
++                        rms_norm_now_aie(a_xn, a_x, _arm)
++                        refeed(
++                            RMS_RF2 or REFEED[GATEUP_PHASE],
++                            lambda: _CH["xnorm"].put(a_xn[0:K]),
++                        )
++                        _CH["outY"].get(
++                            a_op[0 : DOWN_RNDS * PAYLOAD], indices=[0, RMS_DEST]
++                        )
++                        residual_inplace_aie(a_x, a_op)
++                        _CH["layerOut"].put(a_x[0 : DOWN_RNDS * PAYLOAD])
++                        air_api.dealloc(a_op)
++                        air_api.dealloc(a_xn)
++                        air_api.dealloc(a_x)
++                        return
+                     a_x = _rbuf()
+                     _CH["rmsX"].get(a_x, indices=[0])
+                     a_w = _rbuf()
+@@ -4709,7 +4969,7 @@ def build_module():
+                         # -- replaces the invented buf_ph2 memtile stand-in.
+                         rms_norm_aie(a_xn, a_h, (a_w2 if POST_RMS else a_w), _arm)
+                         refeed(
+-                            REFEED[GATEUP_PHASE],
++                            RMS_RF2 or REFEED[GATEUP_PHASE],
+                             lambda: _CH["xnorm"].put(a_xn[0:K]),
+                         )
+                         air_api.dealloc(a_xn)
+diff --git a/programming_examples/fused_decode/kernels/attn_kv.cc b/programming_examples/fused_decode/kernels/attn_kv.cc
+index 8bfe969..36d939b 100644
+--- a/programming_examples/fused_decode/kernels/attn_kv.cc
++++ b/programming_examples/fused_decode/kernels/attn_kv.cc
+@@ -714,6 +714,119 @@ void scale_div_aie(bf16 *a, bf16 *o, float *l) {
+   }
+ }
+ 
++#elif ATTN_IMPL == ATTN_IMPL_2x8x1
++
++// 2 kv heads per CU x 8 padded q heads (see attn_qk.cc). Every routine is the
++// 1x8x1 one applied per kv group g:
++//   S  [16 heads][16 keys]: group g's 8x16 slab at pS + g*128
++//   c/l indexed by padded head: group g at +g*8
++//   V  block [keyhalf][kv][DH/8][8 keys][8 dh]: kv g, chunk j at
++//      pV + (g*colQ + j)*64, key half 1 another 2*colQ*64 on
++//   y  [DH/8][16][8] (f32): group g's 8x8 tile of chunk j at pY + j*128 + g*64
++ATTN_HOT
++void calculate_l(bf16 *__restrict pS, float *__restrict c,
++                 float *__restrict l) {
++  aie_round_nearest_even();
++  using MMUL = aie::mmul<8, 8, 8, bf16, bf16, accfloat>;
++  AIE_LOOP_UNROLL_FULL
++  for (int g = 0; g < KV_HEADS_PER_CU; g++) {
++    bf16 *__restrict pS1 = pS + g * 128;
++    aie::vector<bf16, 64> S_up = aie::load_v<64>(pS1);
++    aie::vector<bf16, 64> S_down = aie::load_v<64>(pS1 + 64);
++    aie::vector<bf16, MMUL::size_A> S0 =
++        aie::concat(aie::filter_even(S_up, 8), aie::filter_even(S_down, 8));
++    aie::vector<bf16, MMUL::size_A> S1 =
++        aie::concat(aie::filter_odd(S_up, 8), aie::filter_odd(S_down, 8));
++    aie::vector<bf16, MMUL::size_B> ones =
++        aie::broadcast<bf16, MMUL::size_B>(1);
++    aie::vector<bf16, MMUL::size_C> acc_C00 = aie::zeros<bf16, MMUL::size_C>();
++    MMUL C00(acc_C00);
++    C00.mac(S0, ones);
++    C00.mac(S1, ones);
++    aie::vector<float, MMUL::size_C> sumf = C00.template to_vector<float>();
++    auto sum03 = aie::filter_even(sumf, 4);
++    auto sum02 = aie::filter_even(sum03, 2);
++    auto sum01 = aie::filter_even(sum02, 1); // 8 row sums
++    aie::accum<accfloat, 16> sum;
++    sum.from_vector(aie::concat(sum01, sum01));
++    aie::vector<float, 8> c8 = aie::load_v<8>(c + g * 8);
++    aie::vector<float, 8> l8 = aie::load_v<8>(l + g * 8);
++    aie::accum<accfloat, 16> l_out = mac_elem_16_accuracy_safe(
++        aie::concat(l8, l8), aie::concat(c8, c8), sum, 0, 0, 0);
++    // store only this group's 8 (the 16-wide result is two copies)
++    aie::store_v(l + g * 8,
++                 l_out.template to_vector<float>().template extract<8>(0));
++  }
++}
++
++template <unsigned colQ, unsigned r, unsigned s, unsigned t>
++ATTN_HOT void attn_fv(bf16 *__restrict pS, bf16 *__restrict pV,
++                      y_acc_dtype *__restrict pY, float *__restrict c) {
++  using MMUL = aie::mmul<r, s, t, bf16, bf16, accfloat>;
++  constexpr unsigned YSTRIDE = KV_HEADS_PER_CU * MMUL::size_C; // 128
++  // Same peano-safe shape as 2x4x1: a pure-vector correction pass, then a mac
++  // pass from a ZERO-init accumulator with the carried y added as a vector
++  // (the load-initialised MMUL drops lane 0 under peano).
++  for (int g = 0; g < KV_HEADS_PER_CU; g++) {
++    aie::vector<bf16, 64> S_up = aie::load_v<64>(pS + g * 128);
++    aie::vector<bf16, 64> S_down = aie::load_v<64>(pS + g * 128 + 64);
++    aie::vector<bf16, MMUL::size_A> S0 =
++        aie::concat(aie::filter_even(S_up, 8), aie::filter_even(S_down, 8));
++    aie::vector<bf16, MMUL::size_A> S1 =
++        aie::concat(aie::filter_odd(S_up, 8), aie::filter_odd(S_down, 8));
++    const float *cg = c + g * 8;
++    {
++      aie::vector<y_acc_dtype, 64> CORRECT = aie::concat(
++          aie::broadcast<float, 8>(cg[0]), aie::broadcast<float, 8>(cg[1]),
++          aie::broadcast<float, 8>(cg[2]), aie::broadcast<float, 8>(cg[3]),
++          aie::broadcast<float, 8>(cg[4]), aie::broadcast<float, 8>(cg[5]),
++          aie::broadcast<float, 8>(cg[6]), aie::broadcast<float, 8>(cg[7]));
++      for (unsigned j = 0; j < colQ; j += 1) {
++        y_acc_dtype *__restrict pYc = pY + j * YSTRIDE + g * MMUL::size_C;
++        aie::store_v(pYc, aie::mul(CORRECT, aie::load_v<MMUL::size_C>(pYc))
++                              .template to_vector<y_acc_dtype>());
++      }
++    }
++    bf16 *__restrict pVg = pV + g * colQ * MMUL::size_B;
++    for (unsigned j = 0; j < colQ; j += 1) {
++      y_acc_dtype *__restrict pYc = pY + j * YSTRIDE + g * MMUL::size_C;
++      bf16 *__restrict pVa = pVg + j * MMUL::size_B;
++      aie::vector<y_acc_dtype, MMUL::size_C> yprev =
++          aie::load_v<MMUL::size_C>(pYc);
++      aie::vector<bf16, MMUL::size_C> zc = aie::zeros<bf16, MMUL::size_C>();
++      MMUL Y0(zc);
++      Y0.mac(S0, aie::load_v<MMUL::size_B>(pVa));
++      Y0.mac(S1, aie::load_v<MMUL::size_B>(pVa + MMUL::size_B * colQ * 2));
++      aie::store_v(pYc,
++                   aie::add(Y0.template to_vector<y_acc_dtype>(), yprev));
++    }
++  }
++}
++
++template <unsigned N>
++__attribute__((noinline)) void scale_div_aie(bf16 *a, bf16 *o, float *l) {
++  // Scalar, like the 2x4x1 path: y/a is PADDED ([DH/8][16][8]), o is PACKED
++  // ([DH/8][Q_HEADS_PER_CU][8]) to match the attnO gather.
++  constexpr int QHP = Q_HEADS_PADDED_PER_CU;
++  constexpr int o_tile = Q_HEADS_PER_CU * 8;
++  bf16 invl[QHP];
++  for (int h = 0; h < QHP; h++)
++    invl[h] = (bf16)getInvBf16(l[h]);
++  for (int d = 0; d < DH / 8; d++) {
++    bf16 *pa = a + d * QHP * 8;
++    bf16 *po = o + d * o_tile;
++    for (int g = 0; g < KV_HEADS_PER_CU; g++) {
++      for (int h = 0; h < Q_HEADS_PER_GROUP; h++) {
++        int grp = g * Q_HEADS_PER_GROUP_PADDED + h;
++        int op = g * Q_HEADS_PER_GROUP + h;
++        bf16 iv = invl[grp];
++        for (int k = 0; k < 8; k++)
++          po[op * 8 + k] = (bf16)((float)pa[grp * 8 + k] * (float)iv);
++      }
++    }
++  }
++}
++
+ #endif
+ 
+ // ---------------------------------------------------------------------------
+@@ -738,7 +851,7 @@ void scale_div_aie(bf16 *a, bf16 *o, float *l) {
+ // for the v64 loads in calculate_l / attn_fv. The logical size is 144 (128
+ // scores + 8 c floats); 144 is not a multiple of 64, so odd blocks would start
+ // misaligned -> garbage v64 loads (head0 sum corruption). Round up to 192.
+-#define SSZ_BLK (((Q_HEADS_PADDED_PER_CU * 16 + 16 + 63) / 64) * 64) // 192
++#define SSZ_BLK (((Q_HEADS_PADDED_PER_CU * 16 + 2 * ATTN_C_FLOATS + 63) / 64) * 64) // 192
+ 
+ // ---------------------------------------------------------------------------
+ // Phase 1 (the reference-faithful block-streamed, AIR-lowered locks): per-block
+diff --git a/programming_examples/fused_decode/kernels/attn_qk.cc b/programming_examples/fused_decode/kernels/attn_qk.cc
+index 4cba156..8cc6cf3 100644
+--- a/programming_examples/fused_decode/kernels/attn_qk.cc
++++ b/programming_examples/fused_decode/kernels/attn_qk.cc
+@@ -84,7 +84,7 @@ void attn_qk(bf16 *__restrict q_ping, bf16 *__restrict q_pong,
+   alignas(aie::vector_decl_align) static __attribute__((section(".data")))
+   bf16 m[16] = {};
+   alignas(aie::vector_decl_align) static
+-      __attribute__((section(".data"))) float c_local[8] = {};
++      __attribute__((section(".data"))) float c_local[ATTN_C_FLOATS] = {};
+   // Peano: non-static so the broadcast/init runs each call (peano's non-atomic
+   // static-init guard lives in unzeroed .bss and may skip the constructor).
+   const aie::vector<bf16, 16> neg_inf = aie::broadcast<bf16, 16>(-0x1.FEp127f);
+@@ -114,8 +114,7 @@ void attn_qk(bf16 *__restrict q_ping, bf16 *__restrict q_pong,
+     bool is_first = (i == L[0]);
+     aie::mask<16> mask = aie::le(idx, (i < 16) ? i : 16);
+     _attn_qk<DH / 8, GQA_R, GQA_S, GQA_T>(q, k, s, m, c_local, mask, is_first);
+-    aie::vector<float, 8> c_vec = aie::load_v<8>(c_local);
+-    aie::store_v(c, c_vec);
++    aie::store_v(c, aie::load_v<ATTN_C_FLOATS>(c_local));
+     _lock_release(k_prod_lock);
+     _lock_release(s_cons_lock);
+     i -= 16;
+@@ -445,6 +444,90 @@ ATTN_HOT void _attn_qk(bf16 *__restrict pQ, bf16 *__restrict pK,
+   }
+ }
+ 
++#elif ATTN_IMPL == ATTN_IMPL_2x8x1
++
++// 2 kv heads per CU, each with up to 8 q heads (padded): the 40q/8kv Qwen 14B
++// geometry (5 -> 8). One 1x8x1-shaped 8x8x8 pass per kv head.
++//   Q  arrives [DH/8][Q_HEADS_PADDED_PER_CU=16][8] (pack_q), so group g's eight
++//      rows of dh-chunk i sit at i*128 + g*64.
++//   K  block is [kv][DH/8][keyhalf][8 keys][8 dh] -- the same per-CU layout the
++//      2x4x1 kernel walks (pK1/pK2 continue from kv 0 into kv 1).
++//   S  out is [16 padded heads][16 keys], group-major, pad rows left untouched.
++//   m/c are indexed by PADDED head (g*8 + h).
++template <unsigned colQ, unsigned r, unsigned s, unsigned t>
++ATTN_HOT void _attn_qk(bf16 *__restrict pQ, bf16 *__restrict pK,
++                       bfloat16 *__restrict pY, bf16 *__restrict m,
++                       float *__restrict c, aie::mask<16> &mask,
++                       bool &is_first) {
++
++  using MMUL = aie::mmul<r, s, t, bf16, bf16, accfloat>;
++  constexpr unsigned QSTRIDE = KV_HEADS_PER_CU * MMUL::size_A; // 128
++
++  bfloat16 *__restrict pY1 = pY;
++  AIE_LOOP_UNROLL_FULL
++  for (int g = 0; g < KV_HEADS_PER_CU; g++) {
++    bf16 *__restrict pK1 = pK + g * colQ * 2 * MMUL::size_B;
++    bf16 *__restrict pK2 = pK1 + MMUL::size_B;
++    bf16 *__restrict pQ1 = pQ + g * MMUL::size_A;
++    aie::vector<bf16, MMUL::size_A> A0 = aie::load_v<MMUL::size_A>(pQ1);
++    pQ1 += QSTRIDE;
++    aie::vector<bf16, MMUL::size_B> B00 = aie::load_v<MMUL::size_B>(pK1);
++    aie::vector<bf16, MMUL::size_B> B0 = aie::transpose(B00, 8, 8);
++    pK1 += MMUL::size_B * 2;
++    aie::vector<bf16, MMUL::size_B> B01 = aie::load_v<MMUL::size_B>(pK2);
++    aie::vector<bf16, MMUL::size_B> B1 = aie::transpose(B01, 8, 8);
++    pK2 += MMUL::size_B * 2;
++
++    aie::vector<bf16, MMUL::size_C> acc_C00 = aie::zeros<bf16, MMUL::size_C>();
++    aie::vector<bf16, MMUL::size_C> acc_C01 = aie::zeros<bf16, MMUL::size_C>();
++    MMUL C00(acc_C00);
++    MMUL C01(acc_C01);
++    C00.mac(A0, B0);
++    C01.mac(A0, B1);
++
++    AIE_PREPARE_FOR_PIPELINING AIE_LOOP_RANGE(7) for (unsigned i = 1; i < colQ;
++                                                      ++i) {
++      A0 = aie::load_v<MMUL::size_A>(pQ1);
++      pQ1 += QSTRIDE;
++      B00 = aie::load_v<MMUL::size_B>(pK1);
++      B0 = aie::transpose(B00, 8, 8);
++      pK1 += MMUL::size_B * 2;
++      B01 = aie::load_v<MMUL::size_B>(pK2);
++      B1 = aie::transpose(B01, 8, 8);
++      pK2 += MMUL::size_B * 2;
++      C00.mac(A0, B0);
++      C01.mac(A0, B1);
++    }
++    // rows = the group's 8 (padded) q heads; C00 keys 0-7, C01 keys 8-15.
++    // interleave_zip by 8 -> [h k0-7, h k8-15] per row: .first rows 0-3,
++    // .second rows 4-7, each head one 16-wide slice (as 1x8x1).
++    auto mout0 = aie::interleave_zip(C00.template to_vector<bf16>(),
++                                     C01.template to_vector<bf16>(), 8);
++    aie::vector<bf16, 64> mout2 =
++        aie::mul(mout0.first, (bf16)ATTN_SCALE).template to_vector<bf16>(0);
++    aie::vector<bf16, 64> mout3 =
++        aie::mul(mout0.second, (bf16)ATTN_SCALE).template to_vector<bf16>(0);
++    aie::vector<bf16, 16> out[8];
++    out[0] = mout2.extract<16>(0);
++    out[1] = mout2.extract<16>(1);
++    out[2] = mout2.extract<16>(2);
++    out[3] = mout2.extract<16>(3);
++    out[4] = mout3.extract<16>(0);
++    out[5] = mout3.extract<16>(1);
++    out[6] = mout3.extract<16>(2);
++    out[7] = mout3.extract<16>(3);
++
++    AIE_LOOP_UNROLL_FULL
++    for (int h = 0; h < Q_HEADS_PER_GROUP; h++) {
++      aie::vector<bf16, 16> vec =
++          update(m + g * 8 + h, c + g * 8 + h, out[h], mask, is_first);
++      aie::store_v(pY1, vec);
++      pY1 += 16;
++    }
++    pY1 += 16 * ATTN_GROUPS_PADDING;
++  }
++}
++
+ #endif
+ 
+ // ---------------------------------------------------------------------------
+@@ -465,7 +548,7 @@ ATTN_HOT void _attn_qk(bf16 *__restrict pQ, bf16 *__restrict pK,
+ #define K_BLK (16 * KV_HEADS_PER_CU * DH) // 16 keys * (2 kv * 64) = 2048 bf16
+ // Per-block score slot padded to a multiple of 64 (alignment for v64 loads in
+ // attn_kv); logical 144 (128 scores + 8 c floats) rounded up to 192.
+-#define SSZ_BLK (((Q_HEADS_PADDED_PER_CU * 16 + 16 + 63) / 64) * 64) // 192
++#define SSZ_BLK (((Q_HEADS_PADDED_PER_CU * 16 + 2 * ATTN_C_FLOATS + 63) / 64) * 64) // 192
+ // ---------------------------------------------------------------------------
+ // Phase 1 (the reference-faithful block-streamed, AIR-lowered locks): per-block
+ // QK. One 16-key block per call. The AIR herd loops rounds=ceil(L/16) and
+@@ -513,6 +596,6 @@ void attn_qk_blk(bf16 *__restrict q, bf16 *__restrict k_block,
+   _attn_qk<DH / 8, GQA_R, GQA_S, GQA_T>(q, k_block, s_block, m_state, c_state,
+                                         mask, is_first);
+   float *c = (float *)(s_block + Q_HEADS_PADDED_PER_CU * 16);
+-  aie::store_v(c, aie::load_v<8>(c_state));
++  aie::store_v(c, aie::load_v<ATTN_C_FLOATS>(c_state));
+ }
+ }
+diff --git a/programming_examples/fused_decode/kernels/glu.cc b/programming_examples/fused_decode/kernels/glu.cc
+index e8d6fba..e5c2b45 100644
+--- a/programming_examples/fused_decode/kernels/glu.cc
++++ b/programming_examples/fused_decode/kernels/glu.cc
+@@ -143,3 +143,26 @@ void glu(bf16 *y_ping, bf16 *y_pong, const bf16 *x_ping, const bf16 *x_pong) {
+   _lock_release(x_prod_lock);
+ }
+ }
++
++#ifdef MOE_SLICES_PER_EXPERT
++// MoE: the 8 selected experts form one dense SwiGLU; every expert spans
++// MOE_SLICES_PER_EXPERT consecutive slices and its output is scaled by its
++// routing weight rw[slice / MOE_SLICES_PER_EXPERT] (host-written per dispatch).
++template <int L>
++void pseduo_glu_scaled(bf16 *y, const bf16 *x, bf16 w) {
++  aie_round_nearest_even();
++  bf16 *gate_ptr = const_cast<bf16 *>(x) + (L / 2);
++  bf16 *hid_ptr = const_cast<bf16 *>(x);
++  aie::vector<bf16, 16> wv = aie::broadcast<bf16, 16>(w);
++  for (int i = 0; i < L / 2; i += 16) {
++    aie::vector<bf16, 16> gate_vec = getActivationBf16(aie::load_v<16>(gate_ptr + i));
++    aie::vector<bf16, 16> t = aie::mul(gate_vec, aie::load_v<16>(hid_ptr + i));
++    aie::store_v(y + i, aie::mul(t, wv).template to_vector<bf16>());
++  }
++}
++extern "C" void glu_moe_aie(bf16 *restrict y, bf16 *restrict x, bf16 *restrict rw,
++                            int slice, int _arm) {
++  (void)_arm;
++  pseduo_glu_scaled<GLU_SLICE>(y, x, rw[slice / MOE_SLICES_PER_EXPERT]);
++}
++#endif
+diff --git a/programming_examples/fused_decode/kernels/model_spec.h b/programming_examples/fused_decode/kernels/model_spec.h
+index 4792a11..036525a 100644
+--- a/programming_examples/fused_decode/kernels/model_spec.h
++++ b/programming_examples/fused_decode/kernels/model_spec.h
+@@ -54,7 +54,7 @@ constexpr int DV = DK;
+ 
+ // Analyze the GQA patterns. 2x4x1 packs 2 kv heads per CU; 1x8x1 / 1x4x1 use 1
+ // kv head per CU (so the CU count equals the kv-head count).
+-#if ATTN_IMPL == ATTN_IMPL_2x4x1
++#if ATTN_IMPL == ATTN_IMPL_2x4x1 || ATTN_IMPL == ATTN_IMPL_2x8x1
+ constexpr int NUM_MHA_CU = NUM_KV_HEADS / 2;
+ #else
+ constexpr int NUM_MHA_CU = NUM_KV_HEADS;
+@@ -85,6 +85,15 @@ const int GQA_R = 8;
+ const int GQA_S = 8;
+ const int GQA_T = 8;
+ constexpr int GQA_SEGMENT_SIZE = 8; // 8x8x8, must be multiple of 8
++constexpr int ATTN_GROUPS_PADDING =
++    ((Q_HEADS_PER_GROUP + GQA_SEGMENT_SIZE - 1) / GQA_SEGMENT_SIZE) *
++        GQA_SEGMENT_SIZE -
++    Q_HEADS_PER_GROUP;
++#elif ATTN_IMPL == ATTN_IMPL_2x8x1
++const int GQA_R = 8;
++const int GQA_S = 8;
++const int GQA_T = 8;
++constexpr int GQA_SEGMENT_SIZE = 8; // one 8x8x8 pass per kv head
+ constexpr int ATTN_GROUPS_PADDING =
+     ((Q_HEADS_PER_GROUP + GQA_SEGMENT_SIZE - 1) / GQA_SEGMENT_SIZE) *
+         GQA_SEGMENT_SIZE -
+@@ -97,6 +106,11 @@ constexpr int Q_HEADS_PER_GROUP_PADDED =
+ constexpr int Q_HEADS_PADDED_PER_CU =
+     KV_HEADS_PER_CU * Q_HEADS_PER_GROUP_PADDED;
+ 
++// Online-softmax correction floats carried per score block (one per padded
++// head; never fewer than the 8 every pre-2x8x1 layout reserves).
++constexpr int ATTN_C_FLOATS =
++    Q_HEADS_PADDED_PER_CU > 8 ? Q_HEADS_PADDED_PER_CU : 8;
++
+ constexpr int VOCAB_SIZE_PADDED =
+     (VOCAB_SIZE + MODEL_DIM - 1) / MODEL_DIM * MODEL_DIM;
+ 
+diff --git a/programming_examples/fused_decode/kernels/rms_residual.cc b/programming_examples/fused_decode/kernels/rms_residual.cc
+index 3c25127..4bfa97b 100644
+--- a/programming_examples/fused_decode/kernels/rms_residual.cc
++++ b/programming_examples/fused_decode/kernels/rms_residual.cc
+@@ -76,6 +76,71 @@ void rms_norm(bf16 *restrict y, const bf16 *restrict x,
+   event1();
+ }
+ 
++// Weightless RMSNorm (NORM_FOLD builds): the norm weight has been folded into
++// the next projection's columns on the host, so y = x / rms(x).
++void rms_norm_now(bf16 *restrict y, const bf16 *restrict x) {
++  bf16 *it_y = const_cast<bf16 *>(y);
++  bf16 *it_x = const_cast<bf16 *>(x);
++  // Added to the MEAN square, so it is comparable to mean(x^2) -- which for
++  // most models is O(1) at every layer and makes the exact value irrelevant.
++  // It is NOT irrelevant for a model whose embeddings are small: LFM2's are
++  // ~0.6 in L2 over 2048 channels, so mean(x^2) ~ 1.8e-4 and layer 0's
++  // normalizer moves by several percent between 1e-6 and 1e-5. Models that
++  // care set RMS_NORM_EPS in their header; the default preserves the value
++  // every previously-shipped model was validated against.
++  const float epsilon = RMS_NORM_EPS;
++
++  constexpr int vector_size = 16;
++  constexpr float one_over_D = 1.0f / (float)MODEL_DIM;
++
++  aie::accum<accfloat, vector_size> sum_squares = aie::zeros<accfloat>();
++  aie::vector<float, vector_size> mx_vec;
++
++  const int F = MODEL_DIM / vector_size;
++  for (int i = 0; i < F; i++) {
++    auto x_vec = aie::load_v<vector_size>(it_x);
++    sum_squares = aie::mac_square(sum_squares, x_vec);
++    it_x += vector_size;
++  }
++
++  it_x = const_cast<bf16 *>(x);
++
++  mx_vec = sum_squares.template to_vector<float>();
++  float sum = aie::reduce_add(mx_vec);
++  sum = sum * one_over_D;
++  // bf16 mean_square = aie::div(sum, bf16(D));
++  // bf16 rms = aie::sqrt(mean_square + epsilon);
++  // bf16 divrms = aie::div(1, (bf16)32);
++  // compute 1 / sqrt(sum + epsilon), use magic
++  sum = sum + epsilon;
++  float x2, divrms;
++  const float threehalfs = 1.5F;
++  uint32_t i_u32;
++
++  x2 = sum * 0.5F;
++  divrms = sum;
++  i_u32 = *(uint32_t *)&divrms;      // evil floating point bit level hacking
++  i_u32 = 0x5f3759df - (i_u32 >> 1); // what the fuck?
++  divrms = *(float *)&i_u32;
++  divrms = divrms * (threehalfs - (x2 * divrms * divrms)); // 1st iteration
++  divrms =
++      divrms * (threehalfs -
++                (x2 * divrms * divrms)); // 2nd iteration, this can be removed
++  // bf16 divrms_bf16 = (bf16)divrms;
++
++  for (int i = 0; i < F; i++) {
++    aie::vector<bf16, vector_size> x_vec = aie::load_v<vector_size>(it_x);
++    aie::accum<accfloat, vector_size> x_acc;
++    x_acc.from_vector(x_vec);
++    aie::vector<float, vector_size> xf_vec = x_acc.template to_vector<float>();
++    aie::vector<bf16, vector_size> o_vec = aie::mul(xf_vec, divrms);
++    aie::store_v(it_y, o_vec);
++    it_x += vector_size;
++    it_y += vector_size;
++  }
++  event1();
++}
++
+ ///@brief residual add: y = x + x_buf, and x_buf = y
+ ///@param y: output
+ ///@param x: input
+@@ -167,6 +232,26 @@ void residual_add_aie(bf16 *restrict y, bf16 *restrict x_buf,
+   residual_add(y, x_buf, x);
+ }
+ 
++// Lean residual (MODEL_DIM >= 5120): x_buf += x in place. residual_add above
++// already leaves x_buf == y, so the separate y buffer is a pure copy; at K=5120
++// that copy (and the second one for residual2) is what pushes the rms core past
++// its 64 KB of L1. Same arithmetic, two K-wide buffers fewer.
++void rms_norm_now_aie(bf16 *restrict y, bf16 *restrict x, int _arm) {
++  aie_round_nearest_even();
++  (void)_arm;
++  rms_norm_now(y, x);
++}
++
++void residual_inplace_aie(bf16 *restrict x_buf, bf16 *restrict x) {
++  aie_round_nearest_even();
++  constexpr int vector_size = 16;
++  for (int i = 0; i < MODEL_DIM; i += vector_size) {
++    auto v = aie::add(aie::load_v<vector_size>(x_buf + i),
++                      aie::load_v<vector_size>(x + i));
++    aie::store_v(x_buf + i, v);
++  }
++}
++
+ // MLIR-managed-lock decode (q4nx_decode_repro): pure-compute leaves that let
+ // the rms core's lock/control-flow live in the aie.core body (explicit
+ // aie.use_lock) instead of inside rms_residual()'s in-kernel
+diff --git a/programming_examples/fused_decode/models/all_models.h b/programming_examples/fused_decode/models/all_models.h
+index 17d3c60..c654324 100644
+--- a/programming_examples/fused_decode/models/all_models.h
++++ b/programming_examples/fused_decode/models/all_models.h
+@@ -13,6 +13,9 @@
+ /// @brief Attention implementation
+ /// @note 1x8x1: for 4 kv heads
+ #define ATTN_IMPL_1x8x1 2
++/// @brief Attention implementation
++/// @note 2x8x1: 2 kv heads per CU, q-per-kv padded to 8 (GQA 5..8, e.g. 40q/8kv)
++#define ATTN_IMPL_2x8x1 3
+ 
+ /// @brief Activation function
+ #define A_SILU 0
+@@ -30,6 +33,11 @@
+ #define LFM2_1_2B 8
+ #define QWEN3_4B 9
+ #define GEMMA4_E2B 10
++#define MISTRAL_NEMO_12B 11
++#define QWEN3_14B 12
++#define QWEN2_5_14B 13
++#define QWEN3MOE_EQUIV 14
++#define QWEN3_30B_A3B 15
+ 
+ #ifndef MODEL_TYPE
+ #define MODEL_TYPE LLAMA_3_2_1B
+@@ -41,11 +49,16 @@
+ #include "../models/llama3.1-8b.h"
+ #include "../models/llama3.2-1b.h"
+ #include "../models/llama3.2-3b.h"
++#include "../models/mistral-nemo-12b.h"
+ #include "../models/phi4-4b.h"
+ #include "../models/qwen2.5-3b.h"
+ #include "../models/qwen2.5-7b.h"
++#include "../models/qwen2.5-14b.h"
+ #include "../models/qwen3-4b.h"
+ #include "../models/qwen3-8b.h"
++#include "../models/qwen3-14b.h"
++#include "../models/qwen3moe-equiv.h"
++#include "../models/qwen3-30b-a3b.h"
+ 
+ /// @brief RMSNorm epsilon, added to the MEAN square.
+ /// @note Every model shipped before this was introduced was validated against
+diff --git a/programming_examples/fused_decode/models/mistral-nemo-12b.h b/programming_examples/fused_decode/models/mistral-nemo-12b.h
+new file mode 100644
+index 0000000..88ad6a1
+--- /dev/null
++++ b/programming_examples/fused_decode/models/mistral-nemo-12b.h
+@@ -0,0 +1,20 @@
++// generated by opennpu.native.specgen from mistral-nemo-12b config.json -- do not edit
++#ifndef __OPENNPU_MISTRAL_NEMO_12B_H__
++#define __OPENNPU_MISTRAL_NEMO_12B_H__
++#if MODEL_TYPE == MISTRAL_NEMO_12B
++constexpr int MODEL_DIM = 5120;
++constexpr int NUM_ATTN_HEADS = 32;
++constexpr int NUM_KV_HEADS = 8;
++constexpr int INTERMEDIATE_SIZE = 14336;
++constexpr int GLU_SLICE = 1024;
++constexpr int DH = 128;
++constexpr int VOCAB_SIZE = 131072;
++constexpr float ATTN_SCALE = 0.08838834764831843f;
++#define ATTN_IMPL ATTN_IMPL_2x4x1
++#define A_FUNC A_SILU
++#define RMS_NORM_EPS 1e-05f
++constexpr int Q4NX_ROW_BLOCK_SIZE = 32;
++constexpr int Q4NX_COL_BLOCK_SIZE = 256;
++constexpr int Q4NX_GROUP_SIZE = 32;
++#endif
++#endif
+diff --git a/programming_examples/fused_decode/models/qwen2.5-14b.h b/programming_examples/fused_decode/models/qwen2.5-14b.h
+new file mode 100644
+index 0000000..84b8bb9
+--- /dev/null
++++ b/programming_examples/fused_decode/models/qwen2.5-14b.h
+@@ -0,0 +1,20 @@
++// generated by opennpu.native.specgen from qwen2.5-14b config.json -- do not edit
++#ifndef __OPENNPU_QWEN2_5_14B_H__
++#define __OPENNPU_QWEN2_5_14B_H__
++#if MODEL_TYPE == QWEN2_5_14B
++constexpr int MODEL_DIM = 5120;
++constexpr int NUM_ATTN_HEADS = 40;
++constexpr int NUM_KV_HEADS = 8;
++constexpr int INTERMEDIATE_SIZE = 13824;
++constexpr int GLU_SLICE = 512;
++constexpr int DH = 128;
++constexpr int VOCAB_SIZE = 152064;
++constexpr float ATTN_SCALE = 0.08838834764831843f;
++#define ATTN_IMPL ATTN_IMPL_2x8x1
++#define A_FUNC A_SILU
++#define HAS_QKV_BIAS
++constexpr int Q4NX_ROW_BLOCK_SIZE = 32;
++constexpr int Q4NX_COL_BLOCK_SIZE = 256;
++constexpr int Q4NX_GROUP_SIZE = 32;
++#endif
++#endif
+diff --git a/programming_examples/fused_decode/models/qwen3-14b.h b/programming_examples/fused_decode/models/qwen3-14b.h
+new file mode 100644
+index 0000000..d131023
+--- /dev/null
++++ b/programming_examples/fused_decode/models/qwen3-14b.h
+@@ -0,0 +1,20 @@
++// generated by opennpu.native.specgen from qwen3-14b config.json -- do not edit
++#ifndef __OPENNPU_QWEN3_14B_H__
++#define __OPENNPU_QWEN3_14B_H__
++#if MODEL_TYPE == QWEN3_14B
++constexpr int MODEL_DIM = 5120;
++constexpr int NUM_ATTN_HEADS = 40;
++constexpr int NUM_KV_HEADS = 8;
++constexpr int INTERMEDIATE_SIZE = 17408;
++constexpr int GLU_SLICE = 1024;
++constexpr int DH = 128;
++constexpr int VOCAB_SIZE = 151936;
++constexpr float ATTN_SCALE = 0.08838834764831843f;
++#define ATTN_IMPL ATTN_IMPL_2x8x1
++#define A_FUNC A_SILU
++#define HAS_QK_NORM
++constexpr int Q4NX_ROW_BLOCK_SIZE = 32;
++constexpr int Q4NX_COL_BLOCK_SIZE = 256;
++constexpr int Q4NX_GROUP_SIZE = 32;
++#endif
++#endif
+diff --git a/programming_examples/fused_decode/models/qwen3-30b-a3b.h b/programming_examples/fused_decode/models/qwen3-30b-a3b.h
+new file mode 100644
+index 0000000..e01b0b6
+--- /dev/null
++++ b/programming_examples/fused_decode/models/qwen3-30b-a3b.h
+@@ -0,0 +1,21 @@
++// generated by opennpu.native.specgen from qwen3-30b-a3b config.json -- do not edit
++#ifndef __OPENNPU_QWEN3_30B_A3B_H__
++#define __OPENNPU_QWEN3_30B_A3B_H__
++#if MODEL_TYPE == QWEN3_30B_A3B
++constexpr int MODEL_DIM = 2048;
++constexpr int NUM_ATTN_HEADS = 32;
++constexpr int NUM_KV_HEADS = 4;
++constexpr int INTERMEDIATE_SIZE = 6144;
++constexpr int GLU_SLICE = 512;  // GLU_PKTS=1: an expert is 3 whole slices
++constexpr int DH = 128;
++constexpr int VOCAB_SIZE = 151936;
++constexpr float ATTN_SCALE = 0.08838834764831843f;
++#define ATTN_IMPL ATTN_IMPL_1x8x1
++#define A_FUNC A_SILU
++#define HAS_QK_NORM
++#define MOE_SLICES_PER_EXPERT 3  // 768 / (GLU_SLICE/2)
++constexpr int Q4NX_ROW_BLOCK_SIZE = 32;
++constexpr int Q4NX_COL_BLOCK_SIZE = 256;
++constexpr int Q4NX_GROUP_SIZE = 32;
++#endif
++#endif
+diff --git a/programming_examples/fused_decode/models/qwen3moe-equiv.h b/programming_examples/fused_decode/models/qwen3moe-equiv.h
+new file mode 100644
+index 0000000..6a7adf4
+--- /dev/null
++++ b/programming_examples/fused_decode/models/qwen3moe-equiv.h
+@@ -0,0 +1,20 @@
++// generated by opennpu.native.specgen from qwen3moe-equiv config.json -- do not edit
++#ifndef __OPENNPU_QWEN3MOE_EQUIV_H__
++#define __OPENNPU_QWEN3MOE_EQUIV_H__
++#if MODEL_TYPE == QWEN3MOE_EQUIV
++constexpr int MODEL_DIM = 2048;
++constexpr int NUM_ATTN_HEADS = 32;
++constexpr int NUM_KV_HEADS = 4;
++constexpr int INTERMEDIATE_SIZE = 6144;
++constexpr int GLU_SLICE = 1024;
++constexpr int DH = 128;
++constexpr int VOCAB_SIZE = 151936;
++constexpr float ATTN_SCALE = 0.08838834764831843f;
++#define ATTN_IMPL ATTN_IMPL_1x8x1
++#define A_FUNC A_SILU
++#define HAS_QK_NORM
++constexpr int Q4NX_ROW_BLOCK_SIZE = 32;
++constexpr int Q4NX_COL_BLOCK_SIZE = 256;
++constexpr int Q4NX_GROUP_SIZE = 32;
++#endif
++#endif
+diff --git a/programming_examples/llms/qwen3_8b_q4nx/bench8b.py b/programming_examples/llms/qwen3_8b_q4nx/bench8b.py
+new file mode 100644
+index 0000000..07908b5
+--- /dev/null
++++ b/programming_examples/llms/qwen3_8b_q4nx/bench8b.py
+@@ -0,0 +1,30 @@
++"""One-load benchmark: NPU prefill TTFT at several prompt lengths + fused decode tok/s."""
++import os, sys, time
++import numpy as np
++
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++import qwen3_8b_q4nx_inference as inf
++
++model = os.environ["Q4NX_MODEL_SOURCE"]
++NTOK = int(os.environ.get("NTOK", "128"))
++LENS = [int(x) for x in os.environ.get("LENS", "17,512,1500").split(",")]
++
++t = time.perf_counter()
++pf = inf._build_prefiller(model)
++print(f"[bench] load {time.perf_counter()-t:.1f}s", flush=True)
++rng = np.random.default_rng(0)
++res = {}
++for L in LENS:
++    pf.clear_context()
++    ids = [int(x) for x in rng.integers(1000, 100000, L)]
++    Kc, Vc, first, ttft = inf._prefill_turn(pf, ids)
++    res[L] = ttft
++    print(f"[bench] prefill L={L}: {ttft:.2f}s  ({L/ttft:.0f} tok/s)", flush=True)
++
++dec = inf.FusedDecoder(model=model, max_L=2048)
++pf.clear_context()
++prompt = [int(x) for x in rng.integers(1000, 100000, 64)]
++Kc, Vc, first, _ = inf._prefill_turn(pf, prompt)
++gen, td = inf._decode_loop(dec, prompt, first, NTOK, Kc, Vc, stop_on_eos=False)
++n = len(gen) - 1
++print(f"[bench] decode {n} tok in {td:.2f}s = {n/td:.2f} tok/s ({td/n*1000:.1f} ms/tok)", flush=True)
+diff --git a/programming_examples/llms/qwen3_8b_q4nx/qwen3_8b_q4nx_prefill.py b/programming_examples/llms/qwen3_8b_q4nx/qwen3_8b_q4nx_prefill.py
+index dcb1215..3b74b22 100644
+--- a/programming_examples/llms/qwen3_8b_q4nx/qwen3_8b_q4nx_prefill.py
++++ b/programming_examples/llms/qwen3_8b_q4nx/qwen3_8b_q4nx_prefill.py
+@@ -196,8 +196,22 @@ class Qwen3Q4nxPrefill:
+         self._embed = w.embed_table
+         self._final_norm = np.asarray(w.final_norm, np.float32)
+         self._lm_head = w.lm_head
++        # Stream the layers: dequant one, make it resident, drop the host copy.
++        stream = hasattr(w.layers, "release")
++        if stream:
++            w.layers.stream = True
+         preload_prefill_weights(w, self.config, self.cache, self.seq, self._rope_lut)
++        if stream:
++            for k in range(len(w.layers)):
++                w.layers.release(k)
++            w.layers.stream = False
+         self._preload_lm_head_gemv()
++        # The lm_head partitions are resident now; the host copies are not needed.
++        self._lm_parts = [np.broadcast_to(np.zeros(1, bfloat16), p.shape) for p in self._lm_parts]
++        self._lm_head = w.lm_head = None
++        import gc
++
++        gc.collect()
+ 
+     def _preload_lm_head_gemv(self):
+         """Build the 10 padded bf16 lm_head partitions [16384, D] and write them
+diff --git a/programming_examples/llms/qwen3_8b_q4nx/qwen3_8b_q4nx_weights.py b/programming_examples/llms/qwen3_8b_q4nx/qwen3_8b_q4nx_weights.py
+index 217c1f6..d6c70c2 100644
+--- a/programming_examples/llms/qwen3_8b_q4nx/qwen3_8b_q4nx_weights.py
++++ b/programming_examples/llms/qwen3_8b_q4nx/qwen3_8b_q4nx_weights.py
+@@ -231,6 +231,45 @@ def _proj_dims(c):
+     }
+ 
+ 
++class LazyLayers:
++    """Per-layer weights dequantized on first access instead of all up front.
++
++    Holding all 36 dequantized bf16 layers on the host (~16 GB) next to their
++    resident BO copies (~16 GB) is what made the 8B prefill OOM. Once a layer's
++    weights are resident on the device, `release(k)` swaps them for zero-stride
++    placeholders of the same shape: the prefill only reads static inputs on the
++    first call per bo_key and needs nothing but their size afterwards.
++    """
++
++    def __init__(self, make, n):
++        self._make, self._n, self._cache = make, n, {}
++        self.stream = False  # release layer k-1 when layer k is first touched
++        self._released = set()
++
++    def __len__(self):
++        return self._n
++
++    def __iter__(self):
++        return (self[k] for k in range(self._n))
++
++    def __getitem__(self, k):
++        if k not in self._cache:
++            if self.stream and k > 0:
++                self.release(k - 1)
++            self._cache[k] = self._make(k)
++        return self._cache[k]
++
++    def release(self, k):
++        lw = self._cache.get(k)
++        if lw is None or k in self._released:
++            return
++        self._released.add(k)
++        for f in lw.__dataclass_fields__:
++            a = getattr(lw, f)
++            if isinstance(a, np.ndarray) and a.size > 4096:
++                setattr(lw, f, np.broadcast_to(np.zeros(1, a.dtype), a.shape))
++
++
+ def load_q4nx_weights(model_source, config=None):
+     """Load Qwen3-8B weights from a `model.q4nx` bundle into a LlamaWeights.
+ 
+@@ -254,27 +293,26 @@ def load_q4nx_weights(model_source, config=None):
+     }, "config dims disagree with the bundle's projection table"
+     embed, norm, lm_head = qm.embed_norm_lmhead()
+ 
+-    layers = []
+-    for k in range(config.n_layers):
++    def _layer(k):
+         w = qm.layer_weights(k)  # each [K, out] bf16
+         rms_in, rms_post = qm.layer_rms(k)
+         qn, kn = qm.layer_qk_norm(k)
+-        layers.append(
+-            LayerWeights(
+-                attn_norm=np.asarray(rms_in, bfloat16),
+-                wq=np.asarray(w["q"], bfloat16),
+-                wk=np.asarray(w["k"], bfloat16),
+-                wv=np.asarray(w["v"], bfloat16),
+-                wo=np.asarray(w["o"], bfloat16),
+-                ffn_norm=np.asarray(rms_post, bfloat16),
+-                w_gate=np.asarray(w["gate"], bfloat16),
+-                w_up=np.asarray(w["up"], bfloat16),
+-                w_down=np.asarray(w["down"], bfloat16),
+-                q_norm=np.asarray(qn, bfloat16),
+-                k_norm=np.asarray(kn, bfloat16),
+-            )
++        return LayerWeights(
++            attn_norm=np.asarray(rms_in, bfloat16),
++            wq=np.asarray(w["q"], bfloat16),
++            wk=np.asarray(w["k"], bfloat16),
++            wv=np.asarray(w["v"], bfloat16),
++            wo=np.asarray(w["o"], bfloat16),
++            ffn_norm=np.asarray(rms_post, bfloat16),
++            w_gate=np.asarray(w["gate"], bfloat16),
++            w_up=np.asarray(w["up"], bfloat16),
++            w_down=np.asarray(w["down"], bfloat16),
++            q_norm=np.asarray(qn, bfloat16),
++            k_norm=np.asarray(kn, bfloat16),
+         )
+ 
++    layers = LazyLayers(_layer, config.n_layers)
++
+     return LlamaWeights(
+         embed_table=np.asarray(embed, bfloat16),
+         layers=layers,

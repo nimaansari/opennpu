@@ -1,0 +1,63 @@
+/* OpenNPU desktop: libadwaita base, the user's system accent colour throughout. */
+
+.thread { padding: 24px 18px 28px; }
+.msg-footer { margin-top: 2px; }
+.msg-footer button { min-height: 24px; min-width: 24px; padding: 0; }
+.user-bubble {
+  background: alpha(currentColor, 0.07);
+  border-radius: 14px;
+  padding: 9px 14px;
+}
+.msg.assistant label { font-size: 1.02em; line-height: 1.4; }
+.error { color: @error_color; }
+.reasoning > title { color: alpha(currentColor, 0.6); }
+.code-block {
+  border-radius: 10px;
+  border: 1px solid alpha(currentColor, 0.12);
+  background: alpha(currentColor, 0.04);
+}
+.code-head { padding: 2px 4px 0 12px; }
+.code-text { padding: 2px 14px 12px; font-size: 0.92em; }
+
+.composer { padding: 6px 18px 16px; }
+.composer-box {
+  border-radius: 14px;
+  border: 1px solid alpha(currentColor, 0.15);
+  background: @view_bg_color;
+}
+.composer-box:focus-within { border-color: @accent_color; }
+.composer-box textview, .composer-box textview text { background: transparent; }
+.composer-row { padding: 4px 6px 6px 6px; }
+
+.starter { padding: 12px 14px; }
+.starter label { font-weight: normal; }
+
+.status-chip {
+  font-size: 0.85em;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: alpha(@accent_color, 0.14);
+}
+
+.create-form { padding: 24px 18px; }
+.prompt-frame {
+  border-radius: 12px;
+  border: 1px solid alpha(currentColor, 0.15);
+  background: @view_bg_color;
+}
+.prompt-frame textview, .prompt-frame textview text { background: transparent; }
+.result-media { border-radius: 12px; }
+
+/* dashboard */
+.dash-card { padding: 12px 14px; }
+.dash-tile { padding: 10px 12px; }
+
+.attach-thumb { border-radius: 8px; }
+.attach-x { min-width: 22px; min-height: 22px; padding: 0; margin: 3px; }
+
+/* discover */
+.hub-badge { font-size: 0.82em; padding: 1px 8px; border-radius: 6px; background: alpha(currentColor, 0.08); }
+.hub-badge.fast { background: alpha(@accent_color, 0.18); font-weight: bold; }
+.hub-badge.ok { background: alpha(@success_color, 0.16); }
+.hub-badge.gated { color: @warning_color; }
+.warning { color: @warning_color; }

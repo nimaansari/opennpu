@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opennpu"
+version = "0.3.0"
+description = "Run local AI models on AMD Ryzen AI NPUs under Linux"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+authors = [{ name = "OpenNPU contributors" }]
+keywords = ["npu", "amd", "ryzen-ai", "xdna", "llm", "linux", "inference"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# The client side (CLI, server front end, web UI) needs nothing beyond the standard library;
+# engines pull in their own stacks via extras.
+dependencies = []
+
+[project.optional-dependencies]
+# Tier 2: any PyTorch / HF / ONNX / timm model with linear layers on the NPU
+universal = ["numpy>=1.26", "torch>=2.4", "transformers>=4.45", "huggingface_hub", "safetensors", "sentencepiece", "protobuf"]
+# native fused engine (dense + MoE LLM decode); also needs pyxrt + mlir-air: ./install.sh --native (README, Install)
+native = ["numpy>=1.26", "ml_dtypes", "transformers>=4.45", "huggingface_hub", "safetensors", "gguf"]
+formats = ["onnx", "onnx2torch", "timm", "gguf"]
+audio = ["librosa"]
+vision = ["pillow"]
+# image / video / speech generation (opennpu image|video|speak, /v1/images, /v1/audio/speech).
+# diffusers itself is installed with --no-deps by install.sh --gen: its metadata pins
+# huggingface-hub<2, which would downgrade the hub that transformers 5 uses; it runs fine on 2.x.
+gen = ["accelerate>=1.0", "pillow", "imageio>=2.30", "imageio-ffmpeg", "soundfile", "importlib_metadata",
+       "sentencepiece", "protobuf", "ftfy", "regex", "filelock"]
+all = ["opennpu[universal,native,formats,audio,vision,gen]"]
+dev = ["pytest", "ruff"]
+
+[project.scripts]
+opennpu = "opennpu.cli:main"
+npu = "opennpu.native.npu_cli:main"
+opennpu-desktop = "opennpu.desktop.app:main"
+
+[tool.setuptools.packages.find]
+include = ["opennpu*"]
+
+[tool.setuptools.package-data]
+opennpu = ["kernels/*/*", "web/*", "web/icons/*", "data/*", "desktop/*.css", "desktop/icons/hicolor/*/apps/*"]
+"opennpu.native" = ["*.sh", "*.md", "patches/*.patch"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = ["E701", "E702", "E731", "E741", "E402", "E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"opennpu/native/moe_runtime.py" = ["F401", "F841"]
+"opennpu/gen/cli.py" = ["F401", "E401"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/unit"]

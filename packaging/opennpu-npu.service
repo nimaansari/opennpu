@@ -1,0 +1,25 @@
+[Unit]
+Description=OpenNPU model server (local models on the AMD NPU) on 127.0.0.1:11540
+Documentation=file://@ROOT@/README.md
+# always on: restart after any exit and never give up; a broken env (e.g. an interpreter
+# removed by an OS upgrade) backs off to one try per 5 min instead of looping hot.
+# `opennpu doctor` says what is wrong. Stop it with `systemctl --user stop` (or `npu stop`).
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=@ROOT@
+ExecStart=/bin/bash -c 'set +u; source @AIRENV@ >/dev/null; exec python3 -m opennpu.native.server --port 11540'
+Environment=OPENNPU_IDLE_S=600
+Environment=PYTHONUNBUFFERED=1
+Environment=OMP_WAIT_POLICY=PASSIVE
+LimitCORE=0
+LimitMEMLOCK=infinity
+Nice=5
+Restart=always
+RestartSec=5
+RestartSteps=8
+RestartMaxDelaySec=300
+
+[Install]
+WantedBy=default.target

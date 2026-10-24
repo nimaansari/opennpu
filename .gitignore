@@ -1,0 +1,15 @@
+build/
+__pycache__/
+*.egg-info/
+*.prj/
+sweep_results.jsonl
+*.log
+.pytest_cache/
+.ruff_cache/
+node_modules/
+test-results/
+# private notes (market / commercial research) stay out of the repository
+reports/Company NPU deployment market.md
+reports/OpenNPU commercial viability.md
+research_notes/Company NPU deployment market/
+research_notes/OpenNPU commercial viability/

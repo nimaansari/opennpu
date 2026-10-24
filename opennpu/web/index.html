@@ -1,0 +1,248 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenNPU</title>
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="icons/circuitry.svg" type="image/svg+xml">
+<link rel="stylesheet" href="app.css">
+<script>/* theme before first paint: no flash of the wrong theme */
+try { const t = JSON.parse(localStorage.getItem("opennpu.theme")); if (t === "light" || t === "dark") document.documentElement.dataset.theme = t; } catch (e) {}
+</script>
+</head>
+<body>
+<a class="skip" href="#input">Skip to message box</a>
+<div class="app" id="app">
+  <aside class="rail" id="rail">
+    <div class="brand">
+      <span class="ico i-circuitry brand-mark" aria-hidden="true"></span>
+      <span>OpenNPU</span>
+    </div>
+    <nav class="nav" aria-label="Main">
+      <button class="nav-item" data-view="chat"><span class="ico i-chat-circle-text"></span>Chat</button>
+      <button class="nav-item" data-view="create"><span class="ico i-sparkle"></span>Create</button>
+      <button class="nav-item" data-view="dashboard"><span class="ico i-chart-bar"></span>Dashboard</button>
+      <button class="nav-item" data-view="models"><span class="ico i-stack"></span>Models</button>
+      <button class="nav-item" data-view="discover"><span class="ico i-compass"></span>Discover</button>
+      <button class="nav-item" data-view="system"><span class="ico i-cpu"></span>System</button>
+    </nav>
+    <div class="rail-section">
+      <div class="rail-head">
+        <span>Conversations</span>
+        <button class="icon-btn" id="newChat" title="New conversation" aria-label="New conversation"><span class="ico i-plus"></span></button>
+      </div>
+      <ul class="convos" id="convos"></ul>
+    </div>
+    <div class="rail-foot">
+      <button class="icon-btn" id="themeBtn" title="Theme" aria-label="Theme"><span class="ico i-circle-half"></span></button>
+      <span class="muted small" id="version"></span>
+    </div>
+  </aside>
+  <div class="backdrop" id="backdrop" hidden></div>
+
+  <main class="main">
+    <!-- CHAT -->
+    <section class="view" id="view-chat">
+      <header class="topbar">
+        <button class="icon-btn only-mobile rail-toggle" aria-label="Menu" title="Menu"><span class="ico i-list"></span></button>
+        <label class="sr" for="modelSel">Model</label>
+        <div class="select-wrap">
+          <select id="modelSel"></select>
+          <span class="ico i-caret-down"></span>
+        </div>
+        <span class="state" id="state" role="status"><span class="state-light"></span><span id="stateText">Connecting</span></span>
+        <button class="icon-btn only-wide" id="panelBtn" title="Live NPU panel" aria-label="Toggle live NPU panel"><span class="ico i-gauge"></span></button>
+      </header>
+      <div class="chat-body">
+        <div class="chat-col">
+          <div class="thread" id="thread" aria-label="Conversation"></div>
+          <form class="composer" id="composer">
+            <div class="attachments" id="attachments" hidden></div>
+            <label class="sr" for="input">Message</label>
+            <textarea id="input" rows="1" placeholder="Message the model" autocomplete="off"></textarea>
+            <input type="file" id="fileIn" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden>
+            <div class="composer-row">
+              <label class="toggle" title="Let reasoning models think before answering (slower)">
+                <input type="checkbox" id="think"><span class="ico i-brain"></span><span>Think</span>
+              </label>
+              <button type="button" class="icon-btn" id="attachBtn" title="Attach an image (vision models)" aria-label="Attach an image"><span class="ico i-paperclip"></span></button>
+              <button type="button" class="icon-btn" id="micBtn" title="Speak (speech to text on the NPU)" aria-label="Start voice input"><span class="ico i-microphone"></span></button>
+              <span class="muted small" id="hint">Enter to send, Shift+Enter for a new line</span>
+              <button type="submit" class="send" id="send" aria-label="Send"><span class="ico i-arrow-up"></span></button>
+            </div>
+          </form>
+        </div>
+        <aside class="live" id="live" aria-label="Live NPU telemetry">
+          <h2 class="live-title">On the NPU</h2>
+          <div class="metric">
+            <div class="metric-row"><span class="muted">NPU busy</span><span class="num" id="mBusy">0%</span></div>
+            <canvas id="spark" height="56" aria-hidden="true"></canvas>
+          </div>
+          <div class="metric-row"><span class="muted">Server CPU</span><span class="num" id="mCpu">-</span></div>
+          <div class="metric-row"><span class="muted">System power</span><span class="num" id="mPow">-</span></div>
+          <div class="metric-row"><span class="muted">Server memory</span><span class="num" id="mMem">-</span></div>
+          <div class="metric-row"><span class="muted">Unloads in</span><span class="num" id="mIdle">-</span></div>
+          <hr>
+          <h2 class="live-title">Last reply</h2>
+          <div class="metric-row"><span class="muted">Decode</span><span class="num" id="lTok">-</span></div>
+          <div class="metric-row"><span class="muted">First token</span><span class="num" id="lTtft">-</span></div>
+          <div class="metric-row"><span class="muted">Tokens</span><span class="num" id="lN">-</span></div>
+          <div class="metric-row"><span class="muted">Energy</span><span class="num" id="lJ">-</span></div>
+          <p class="fine" id="powNote">Power is the whole laptop, sampled from the battery sensor during each reply while unplugged. The driver reports no NPU-only power.</p>
+        </aside>
+      </div>
+    </section>
+
+    <!-- CREATE: images, video, voice -->
+    <section class="view" id="view-create" hidden>
+      <header class="page-head">
+        <button class="icon-btn only-mobile rail-toggle" aria-label="Menu" title="Menu"><span class="ico i-list"></span></button>
+        <h1>Create</h1>
+        <p class="muted">Images, video and voice, generated on the NPU.</p>
+      </header>
+      <div class="gen-wrap">
+        <div class="gen-tabs" id="genTabs" role="group" aria-label="What to create">
+          <button type="button" data-task="image" aria-pressed="true"><span class="ico i-image"></span>Image</button>
+          <button type="button" data-task="video" aria-pressed="false"><span class="ico i-film-strip"></span>Video</button>
+          <button type="button" data-task="speech" aria-pressed="false"><span class="ico i-waveform"></span>Voice</button>
+        </div>
+        <form class="panel gen-form" id="genForm">
+          <label class="gen-label" for="genModel">Model</label>
+          <div class="select-wrap"><select id="genModel"></select><span class="ico i-caret-down"></span></div>
+          <p class="fine" id="genModelNote"></p>
+          <label class="gen-label" for="genPrompt">Prompt</label>
+          <textarea id="genPrompt" rows="3"></textarea>
+          <p class="fine" id="genHint"></p>
+          <div class="gen-opts" id="genImageOpts">
+            <label>Size <select id="genSize"><option>512x512</option><option>768x768</option><option>1024x1024</option><option>768x512</option><option>512x768</option></select></label>
+          </div>
+          <div class="gen-opts" id="genVideoOpts" hidden>
+            <label>Frames <input id="genFrames" type="number" min="1" max="121" step="1" placeholder="model default"></label>
+          </div>
+          <div class="gen-opts" id="genVoiceOpts" hidden>
+            <label>Format <select id="genFormat"><option value="wav">WAV</option><option value="mp3">MP3</option><option value="opus">Opus</option><option value="flac">FLAC</option></select></label>
+          </div>
+          <div class="gen-opts gen-common">
+            <label>Steps <input id="genSteps" type="number" min="1" max="100" placeholder="model default"></label>
+            <label>Seed <input id="genSeed" type="number" min="0" placeholder="random"></label>
+          </div>
+          <div class="gen-error" id="genError" role="alert" hidden></div>
+          <div class="gen-actions">
+            <span class="fine">Ctrl+Enter to generate</span>
+            <button class="btn primary" id="genGo" type="submit"><span class="ico i-sparkle"></span>Generate</button>
+          </div>
+        </form>
+        <div class="gen-results" id="genResults"></div>
+      </div>
+    </section>
+
+    <!-- DASHBOARD: usage analytics + hardware, stored only on this computer -->
+    <section class="view" id="view-dashboard" hidden>
+      <header class="page-head">
+        <button class="icon-btn only-mobile rail-toggle" aria-label="Menu" title="Menu"><span class="ico i-list"></span></button>
+        <h1>Dashboard</h1>
+        <p class="muted">Your usage and your hardware. Kept only on this computer; prompts and replies are never recorded.</p>
+      </header>
+      <div class="dash">
+        <div class="dash-bar">
+          <div class="seg" id="dashTabs" role="tablist" aria-label="Dashboard section">
+            <button role="tab" data-tab="usage" aria-selected="true">Usage</button>
+            <button role="tab" data-tab="hardware" aria-selected="false">Hardware</button>
+          </div>
+          <div class="seg" id="dashRange" role="group" aria-label="Time range"></div>
+          <span class="dash-spacer"></span>
+          <label class="switch" title="Record usage on this computer"><input type="checkbox" id="dashRecord"><span>Recording</span></label>
+          <a class="btn" id="dashCsv" href="/api/usage.csv" download="opennpu-usage.csv"><span class="ico i-download-simple"></span>Export CSV</a>
+          <button class="btn" id="dashClear" type="button"><span class="ico i-trash"></span>Clear history</button>
+        </div>
+        <div id="dashUsage"></div>
+        <div id="dashHardware" hidden></div>
+        <p class="fine" id="dashWhere"></p>
+      </div>
+    </section>
+
+    <!-- MODELS -->
+    <section class="view" id="view-models" hidden>
+      <header class="page-head">
+        <button class="icon-btn only-mobile rail-toggle" aria-label="Menu" title="Menu"><span class="ico i-list"></span></button>
+        <h1>Models</h1>
+        <p class="muted">Every model here runs on the NPU. Pick one to start a conversation.</p>
+      </header>
+      <div id="modelGroups"></div>
+    </section>
+
+    <!-- DISCOVER: search Hugging Face, see how a model runs on the NPU, download it -->
+    <section class="view" id="view-discover" hidden>
+      <header class="page-head">
+        <button class="icon-btn only-mobile rail-toggle" aria-label="Menu" title="Menu"><span class="ico i-list"></span></button>
+        <h1>Discover</h1>
+        <p class="muted">Search Hugging Face, see how each model runs on the NPU, and download it. Downloads go through this OpenNPU server.</p>
+      </header>
+      <div class="disc">
+        <div class="disc-bar">
+          <div class="search-wrap">
+            <span class="ico i-magnifying-glass" aria-hidden="true"></span>
+            <label class="sr" for="hubQ">Search Hugging Face models</label>
+            <input id="hubQ" type="search" placeholder="Search models, e.g. qwen3" autocomplete="off" spellcheck="false" maxlength="100">
+          </div>
+          <label class="sr" for="hubSort">Sort by</label>
+          <div class="select-wrap">
+            <select id="hubSort">
+              <option value="downloads">Most downloaded</option>
+              <option value="likes">Most liked</option>
+              <option value="trending_score">Trending</option>
+              <option value="last_modified">Recently updated</option>
+            </select>
+            <span class="ico i-caret-down"></span>
+          </div>
+        </div>
+        <div class="seg chips" id="hubTasks" role="group" aria-label="Task">
+          <button type="button" data-task="chat" aria-pressed="true">Chat</button>
+          <button type="button" data-task="vision" aria-pressed="false">Vision</button>
+          <button type="button" data-task="embed" aria-pressed="false">Embeddings</button>
+          <button type="button" data-task="speech" aria-pressed="false">Speech</button>
+          <button type="button" data-task="image" aria-pressed="false">Image</button>
+          <button type="button" data-task="video" aria-pressed="false">Video</button>
+          <button type="button" data-task="all" aria-pressed="false">All</button>
+        </div>
+        <section class="hub-pulls" id="hubPulls" aria-label="Downloads" hidden></section>
+        <div class="gen-error" id="hubError" role="alert" hidden></div>
+        <p class="sr" id="hubCount" role="status"></p>
+        <div class="hub-list" id="hubResults" aria-label="Search results"></div>
+      </div>
+    </section>
+
+    <!-- SYSTEM -->
+    <section class="view" id="view-system" hidden>
+      <header class="page-head">
+        <button class="icon-btn only-mobile rail-toggle" aria-label="Menu" title="Menu"><span class="ico i-list"></span></button>
+        <h1>System</h1>
+        <p class="muted">The NPU this server drives and how to reach it from other apps.</p>
+      </header>
+      <div class="sys-grid">
+        <div class="panel">
+          <h2>Device</h2>
+          <dl class="kv" id="devKv"></dl>
+        </div>
+        <div class="panel">
+          <h2>Connect an app</h2>
+          <p class="muted small">OpenAI-compatible clients (Open WebUI, Continue, OpenCode, the openai SDK):</p>
+          <div class="code-line"><code id="oaiUrl"></code><button class="icon-btn copy" data-copy="oaiUrl" aria-label="Copy"><span class="ico i-copy"></span></button></div>
+          <p class="muted small">Ollama-compatible clients:</p>
+          <div class="code-line"><code id="olUrl"></code><button class="icon-btn copy" data-copy="olUrl" aria-label="Copy"><span class="ico i-copy"></span></button></div>
+          <p class="muted small">From a terminal:</p>
+          <pre class="snippet" id="curlSnip" tabindex="0" aria-label="Example request"></pre>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+<div class="sr" id="announce" aria-live="polite"></div>
+<script src="app.js"></script>
+<script src="gen.js"></script>
+<script src="charts.js"></script>
+<script src="dash.js"></script>
+<script src="hub.js"></script>
+</body>
+</html>

@@ -1,0 +1,24 @@
+{
+  "arch": "aie2p",
+  "K": 1024,
+  "M_buckets": [
+    128,
+    256,
+    384,
+    512,
+    768,
+    1024
+  ],
+  "N_tiles": [
+    256,
+    512,
+    1024,
+    2048,
+    4096
+  ],
+  "dtype_in": "i8",
+  "dtype_out": "i32",
+  "precision": "int8",
+  "core_sha256": "c5c01c9dfe57f91118469f702aea38d96261075d3def02f1dd87261359c407cf",
+  "xclbin": "gemm.xclbin"
+}
