@@ -26,7 +26,7 @@ for running your own models on it. OpenNPU is that app, open source, with its ow
 git clone https://github.com/nimaansari/opennpu && cd opennpu
 ./install.sh --check        # checks kernel, NPU driver, XRT, permissions; prints the fix for anything missing
 ./install.sh --native       # recommended: every NPU engine, incl. GGUF / LM Studio models via llama.cpp (~5 GB)
-./install.sh --gen          # optional: + image, video and speech generation
+./install.sh --gen          # optional: + image, video and speech generation, and voice input
 ```
 
 `--native` adds the MLIR-AIR toolchain (NPU kernels are compiled for each model's matrix shapes on

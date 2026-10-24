@@ -18,7 +18,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
-      - run: pip install numpy pillow huggingface_hub
+      - run: pip install numpy pillow huggingface_hub imageio-ffmpeg   # imageio-ffmpeg: voice input decodes audio (--gen)
       - uses: actions/setup-node@v4
         with: { node-version: "22" }
       - working-directory: tests/e2e

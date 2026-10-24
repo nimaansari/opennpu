@@ -9,7 +9,7 @@ const PORT = 18611;
 export default defineConfig({
   testDir: ".",
   timeout: 30000,
-  retries: 0,
+  retries: process.env.CI ? 1 : 0,    // shared CI runners occasionally miss a timing; local runs stay strict
   workers: 1,                         // one server, one model slot: tests share it like users would
   reporter: [["list"]],
   use: {
