@@ -160,8 +160,8 @@ _INFO = {}
 
 
 def gguf_info(path):
-    """(metadata {key: scalar or string}, [GTensor]) of a GGUF, without reading tensor data or
-    vocabulary arrays (cached per file)."""
+    """(metadata {key: scalar, string or short numeric list}, [GTensor]) of a GGUF, without reading
+    tensor data or vocabulary arrays (cached per file)."""
     import struct
     from gguf.constants import GGML_QUANT_SIZES, GGMLQuantizationType
     st = os.stat(path)
@@ -188,6 +188,8 @@ def gguf_info(path):
                 if et == 8:
                     for _ in range(n):
                         f.seek(struct.unpack("<Q", rd(8))[0], 1)
+                elif et in _GG_FIXED and n <= 4096 and et != 7:      # small numeric lists (per-layer values)
+                    kv[k] = list(struct.unpack(f"<{n}{_GG_FMT[et][1]}", rd(_GG_FIXED[et] * n)))
                 elif et in _GG_FIXED:
                     f.seek(_GG_FIXED[et] * n, 1)
                 else:
@@ -216,6 +218,39 @@ def gguf_info(path):
 def _kv_suffix(kv, suffix, default=0):
     """A per-architecture key (e.g. "qwen3moe.expert_count") by its suffix."""
     return next((v for k, v in kv.items() if k.endswith(suffix)), default)
+
+
+def kv_cache_bytes(path, tokens, slots=1):
+    """RAM llama.cpp's KV cache takes for `tokens` positions over `slots` slots, f16, from the GGUF
+    header. Hybrid models (Qwen3.5/3.6) count every full_attention_interval-th layer. With sliding-
+    window attention, full layers are those with fewer KV heads when the per-layer counts differ
+    (Gemma 4: every 6th), else half of them (gpt-oss; conservative for Gemma 3); the window layers
+    hold `sliding_window` positions per slot."""
+    kv, _ = gguf_info(path)
+    arch = kv.get("general.architecture", "")
+    g = lambda k, d=0: kv.get(f"{arch}.{k}", d)     # noqa: E731
+    n_layer = int(g("block_count"))
+    heads = g("attention.head_count", 1)
+    hq = max(heads) if isinstance(heads, list) else int(heads)
+    kvh = g("attention.head_count_kv", heads)
+    per = [int(x) for x in (kvh if isinstance(kvh, list) else [kvh] * n_layer)][:n_layer]
+    k_len = int(g("attention.key_length", int(g("embedding_length")) // max(hq, 1)))
+    v_len = int(g("attention.value_length", k_len))
+    win = int(g("attention.sliding_window"))
+    full, swa = list(range(len(per))), []
+    if g("full_attention_interval"):
+        n = int(g("full_attention_interval"))
+        full = full[n - 1::n]
+    elif win:
+        if len(set(per)) > 1:
+            full = [i for i in full if per[i] == min(per)]
+        else:
+            full = full[1::2]
+        swa = [i for i in range(len(per)) if i not in full]
+    ks, vs = int(g("attention.key_length_swa", k_len)), int(g("attention.value_length_swa", v_len))
+    b = sum(per[i] for i in full) * (k_len + v_len) * 2 * tokens
+    b += sum(per[i] for i in swa) * (ks + vs) * 2 * min(tokens, win * slots)
+    return b
 
 
 def gguf_arch(path):

@@ -902,7 +902,17 @@ def estimate_bytes(kind, info):
         from opennpu.loaders import param_count
         return (param_count(info[0]) or 4e9) * 0.6 + 2 * 2**30
     if kind == "llama":                   # NPU-packed weights ~ the GGUF's size; the mmap is page cache
-        return Path(info[0]).stat().st_size * 1.1 + 1.5 * 2**30
+        from opennpu.native import llamacpp as lc
+        tokens = lc.CTX * lc.SLOTS
+        est = Path(info[0]).stat().st_size * 1.1 + 1.5 * 2**30
+        try:                              # + KV cache of every slot (Llama-3.1-8B: 4 GiB at 4 x 8k)
+            est += lc.kv_cache_bytes(info[0], tokens, lc.SLOTS)
+            d = lc.draft_for(info[0])     # + the speculative draft model and its cache
+            if d:
+                est += Path(d).stat().st_size * 1.1 + lc.kv_cache_bytes(d, tokens, lc.SLOTS)
+        except Exception as e:            # noqa: BLE001 - an odd header: weights-only estimate
+            log(f"memory estimate for {info[0]}: {e!r}")
+        return est
     if kind in ("universal", "embed"):
         from opennpu.loaders import param_count
         n = param_count(info[0]) or 1e9

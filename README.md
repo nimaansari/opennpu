@@ -2,12 +2,20 @@
 
 **Local AI on the NPU of AMD Ryzen AI laptops, on Linux.**
 
+[![CI](https://github.com/nimaansari/opennpu/actions/workflows/ci.yml/badge.svg)](https://github.com/nimaansari/opennpu/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+![Platform: Linux | AMD Ryzen AI (XDNA2)](https://img.shields.io/badge/platform-Linux%20%7C%20AMD%20Ryzen%20AI%20(XDNA2)-informational)
+
+![OpenNPU chatting with Llama-3.1-8B on the NPU: 16 tok/s, CPU idle](docs/images/chat.png)
+
 macOS has Core ML and Apple Intelligence. Windows has Copilot+ PCs, Foundry Local and the Ryzen AI
 software. On Linux, the NPU in millions of Ryzen AI laptops mostly sits idle: there has been no app
 for running your own models on it. OpenNPU is that app, open source, with its own NPU engines
 (no closed runtime underneath).
 
 - **Chat** with local LLMs in a web UI, a native GTK desktop app, or the terminal
+- **Your existing models**: GGUF files from LM Studio or Hugging Face (llama.cpp with its matrix
+  math on the NPU) and Hugging Face checkpoints; it adapts each one to the NPU automatically
 - **Vision**: attach or paste an image and ask about it (any Hugging Face vision-language model)
 - **Voice**: talk to it (Whisper on the NPU) and have replies read aloud
 - **Images, video and speech** generation (diffusers, text-to-speech)
@@ -60,6 +68,30 @@ Discover (web UI and desktop app) searches Hugging Face, shows which engine woul
 whether it fits in RAM, and downloads it with progress and cancel; then "Chat now" opens it.
 
 From other apps: OpenAI base URL `http://127.0.0.1:11540/v1`, or Ollama at `http://127.0.0.1:11540`.
+
+### Which model should I pick?
+
+Measured on a Ryzen AI 7 PRO 350 laptop (64 GB DDR5-5600), 4-bit models:
+
+| You want | Try | Speed |
+|---|---|---|
+| Best quality that still feels fast | **gpt-oss-20b**, **Qwen3.6-35B-A3B**, Qwen3-30B-A3B (mixture-of-experts) | 14-18 tok/s |
+| Instant replies, small tasks | Qwen3-0.6B, Llama-3.2-1B, Gemma-3-1B | 55-100 tok/s |
+| A solid all-rounder | Llama-3.1-8B (with Llama-3.2-1B installed as its draft) | 11-16 tok/s |
+| Coding | Qwen2.5-Coder-32B or Qwen2.5-14B (with Qwen2.5-0.5B installed as draft) | 4-14 tok/s |
+| The biggest dense models (27-32B) | work, but slowly | 2.4-4.3 tok/s |
+
+Mixture-of-experts models give the best quality per second here because each word only reads a
+small part of the model; see [Limits](#limits) for why dense models are bound by memory speed.
+
+## Screenshots
+
+| | |
+|---|---|
+| ![Models: every installed model and the engine that runs it](docs/images/models.png) | ![Discover: search Hugging Face, see how each model runs on the NPU, download it](docs/images/discover.png) |
+| **Models**: everything installed, by engine | **Discover**: search, check the fit, download |
+| ![Dashboard: usage over time, speed, NPU time; stored only on your computer](docs/images/dashboard.png) | ![Chat in the light theme, with live NPU activity](docs/images/chat-light.png) |
+| **Dashboard**: your usage, kept on your computer | **Light theme**, with live NPU activity |
 
 ## Engines and speed
 
